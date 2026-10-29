@@ -60,7 +60,9 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
   with [vis-network](https://visjs.github.io/vis-network/) (9.1.9, in
   `static/vendor/`). Double-click a node to expand it (or contract it
   again); delete nodes, cluster a node's neighbours, and hide edges below
-  a weight. A node expands by one of its relations:
+  a weight. "Delete orphans" removes the nodes with no edges shown, so
+  raising the minimum weight and then deleting orphans prunes the graph
+  to its strongest connections. A node expands by one of its relations:
   - its direct links, as arrows the way the links point; or
   - the objects reached through the objects linking to it, weighted by
     how many: through `/dblp/publication/author`, an author's co-authors

@@ -76,6 +76,8 @@ async function showGraph(startId) {
         button('Expand', () => selected && expand(selected, relSelect.value),
                'Add the selected node\'s neighbours (or double-click a node)'),
         button('Delete', () => selected && removeNode(selected), 'Remove the selected node'),
+        button('Delete orphans', deleteOrphans,
+               'Remove every node with no edges shown (raise the minimum edge weight first to prune)'),
         button('Cluster', () => selected && toggleCluster(selected),
                'Collapse the selected node\'s neighbours into one node, or open a cluster'),
         button('Clear', clear, 'Remove every node')),
@@ -215,6 +217,17 @@ async function showGraph(startId) {
     expanded.delete(id);
     if (selected === id) select(null);
     if (refresh) refreshNodeSizes();
+  }
+
+  // Nodes with no edges shown: none at all, or only edges below the
+  // minimum weight.
+  function deleteOrphans() {
+    const linked = new Set();
+    edgeView.get().forEach(e => { linked.add(e.from); linked.add(e.to); });
+    const orphans = nodes.getIds().filter(id => !linked.has(id));
+    orphans.forEach(id => removeNode(id, false));
+    refreshNodeSizes();
+    status.textContent += ` (deleted ${orphans.length} orphan${orphans.length === 1 ? '' : 's'})`;
   }
 
   function toggleCluster(id) {
