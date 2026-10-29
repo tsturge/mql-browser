@@ -27,7 +27,9 @@ from pymql.mql import error
 from pymql.mql import graph
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string('graphd_addr', None, 'graphd address, host:port')
+# pymql's bootstrap defines the same flag; the tests import both.
+if 'graphd_addr' not in FLAGS:
+  flags.DEFINE_string('graphd_addr', None, 'graphd address, host:port')
 flags.DEFINE_string('host', '127.0.0.1', 'address to listen on')
 flags.DEFINE_integer('port', 8080, 'port to listen on')
 
@@ -66,7 +68,9 @@ class Graph(object):
   def read(self, query, cursor=None):
     env = {'escape': False}
     if cursor is not None:
-      env['cursor'] = cursor
+      # As in Freebase's API, an empty cursor starts paging; pymql wants
+      # True for that.
+      env['cursor'] = True if cursor in ('', 'true') else cursor
     with self.lock:
       # A new service per read: MQLService caches namespace contents and
       # would not see changes made by other clients.
@@ -209,7 +213,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
   def do_GET(self):
     url = urllib.parse.urlparse(self.path)
-    params = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
+    params = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query, keep_blank_values=True).items()}
     try:
       if url.path == '/api/mqlread':
         self.mqlread(params)

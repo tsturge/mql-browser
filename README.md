@@ -34,6 +34,18 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server.py \
     --graphd_addr=localhost:8200 --port=8080
 ```
 
+## Tests
+
+`server_test.py` starts its own graphd on a free port in a temporary
+directory, bootstraps it, loads a small test domain, and tests the API
+and the static files. It looks for the graphd binary in
+`--graphd_binary`, then `$GRAPHD`, then `../graphd/out/bin/graphd`, and
+is skipped if there is none:
+
+```
+$ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
+```
+
 ## Pages
 
 - `#/view/ID`: an object. A type's page also lists its properties and
