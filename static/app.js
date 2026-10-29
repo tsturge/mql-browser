@@ -229,21 +229,36 @@ function showQuery() {
 
 // ---- home and routing ----
 
-function showHome() {
+// Domains that are part of MQL itself, not data.
+const SYSTEM_DOMAINS = new Set(['/type', '/freebase']);
+const HOME_TYPES = 60;
+
+async function showHome() {
   document.title = 'MQL Browser';
-  const examples = [
-    ['/en/The_Police_$0028Ska_Artist$0029', 'The Police'],
-    ['/en/Barack_Obama', 'Barack Obama'],
-    ['/en/Harrison_Ford', 'Harrison Ford'],
-    ['/en/Honolulu', 'Honolulu'],
-    ['/fbe/musical_album', 'the Musical Album type'],
-    ['/fbe', 'the /fbe domain'],
-  ];
+  render(el('h1', {}, 'MQL Browser'), el('p', {class: 'note'}, 'Loading…'));
+  const {result} = await api('/api/mqlread', {query: JSON.stringify([{
+    type: '/type/domain',
+    id: null,
+    name: null,
+    types: [{id: null, name: null, optional: true, limit: HOME_TYPES + 1}],
+  }])});
+  const domains = result.filter(d => !SYSTEM_DOMAINS.has(d.id));
   render(
     el('h1', {}, 'MQL Browser'),
-    el('p', {}, 'Search by name above, enter an id, or start from one of these:'),
-    el('ul', {class: 'results'}, examples.map(([id, label]) =>
-      el('li', {}, el('a', {href: viewHref(id)}, label), el('span', {class: 'mono'}, id)))));
+    el('p', {}, 'Search by name above, enter an id, or start from a type:'),
+    domains.length ? domains.map(d => {
+      const types = d.types.slice(0, HOME_TYPES)
+        .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+      return el('div', {class: 'section'},
+        el('div', {class: 'section-head'},
+          el('h3', {}, objectLink(d)),
+          el('span', {class: 'mono'}, d.id)),
+        el('div', {class: 'prop'},
+          el('dd', {style: 'grid-column: 1 / -1'}, el('div', {class: 'values'},
+            types.map(objectLink),
+            d.types.length > HOME_TYPES &&
+              el('a', {href: viewHref(d.id)}, 'more…')))));
+    }) : el('p', {class: 'note'}, 'This graph has no data domains yet.'));
 }
 
 async function route() {
