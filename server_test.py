@@ -52,6 +52,8 @@ ROOT = {'user': '/user/root', 'privileged': scope.Privileged}
 BAND = '/en/the_testers'
 FIRST = '/en/first_light'
 SECOND = '/en/second_wind'
+ALICE = '/en/alice'
+BOB = '/en/bob'
 
 
 def _free_port():
@@ -97,7 +99,8 @@ def load_test_data(conn):
       'create': 'unless_exists', 'id': None, 'type': '/type/domain',
       'key': {'namespace': '/', 'value': 't'}, 'name': _text('Sample domain'),
   }, **ROOT)
-  for key, name in [('band', 'Band'), ('album', 'Album')]:
+  for key, name in [('band', 'Band'), ('album', 'Album'),
+                    ('singer', 'Singer'), ('song', 'Song')]:
     mql.write({
         'create': 'unless_exists', 'id': None, 'type': '/type/type',
         'key': {'namespace': '/t', 'value': key}, 'name': _text(name),
@@ -126,6 +129,31 @@ def load_test_data(conn):
         'key': {'namespace': '/en', 'value': key}, 'name': _text(name),
         '/t/album/artist': {'id': BAND, 'connect': 'insert'},
         '/t/album/released': {'value': year, 'connect': 'insert'},
+    }, **ROOT)
+
+  # Singers and songs, for the graph view: Alice and Bob sing two duets,
+  # and Alice a solo.
+  mql.write({
+      'create': 'unless_exists', 'id': None, 'type': '/type/property',
+      'key': {'namespace': '/t/song', 'value': 'performer'},
+      'name': _text('Performer'),
+      '/type/property/schema': {'id': '/t/song'},
+      '/type/property/expected_type': {'id': '/t/singer'},
+      '/type/property/unique': False,
+  }, **ROOT)
+  for key, name in [('alice', 'Alice'), ('bob', 'Bob')]:
+    mql.write({
+        'create': 'unconditional', 'id': None, 'type': '/t/singer',
+        'key': {'namespace': '/en', 'value': key}, 'name': _text(name),
+    }, **ROOT)
+  for key, name, performers in [('duet', 'Duet', [ALICE, BOB]),
+                                ('duet_2', 'Duet Again', [ALICE, BOB]),
+                                ('solo', 'Solo', [ALICE])]:
+    mql.write({
+        'create': 'unconditional', 'id': None, 'type': '/t/song',
+        'key': {'namespace': '/en', 'value': key}, 'name': _text(name),
+        '/t/song/performer': [{'id': p, 'connect': 'insert'}
+                              for p in performers],
     }, **ROOT)
 
 
@@ -285,6 +313,46 @@ class ServerTest(GraphdTestCase):
     self.assertEqual(self.graph.search('   '), [])
     self.assertEqual(self.graph.search('zzzzqq'), [])
 
+  def testRelations(self):
+    rels = self.graph.relations(ALICE)['relations']
+    self.assertEqual(rels[0], {'label': 'Direct links', 'via': None, 'to': None})
+    self.assertIn({
+        'label': 'Performer of, then Performer',
+        'via': '/t/song/performer',
+        'to': '/t/song/performer',
+        'unique': False,
+        'count': 3,
+    }, rels)
+
+  def testExpandThroughSharedObjects(self):
+    # Alice's co-performers, weighted by the songs they share.
+    e = self.graph.expand(ALICE, '/t/song/performer', '/t/song/performer')
+    self.assertEqual(e['center'], {'id': ALICE, 'name': 'Alice',
+                                   'types': ['/t/singer']})
+    self.assertEqual(e['nodes'], [{'id': BOB, 'name': 'Bob',
+                                   'types': ['/t/singer']}])
+    self.assertEqual(e['edges'], [{
+        'from': ALICE, 'to': BOB, 'weight': 2, 'labels': ['Performer'],
+        'directed': False,
+    }])
+    self.assertEqual(e['via_count'], 3)
+    self.assertFalse(e['truncated'])
+
+  def testExpandDirectLinks(self):
+    e = self.graph.expand(BOB)
+    self.assertCountEqual([n['name'] for n in e['nodes']],
+                          ['Duet', 'Duet Again'])
+    # The songs link to Bob, so the edges point at him.
+    for edge in e['edges']:
+      self.assertEqual(edge['to'], BOB)
+      self.assertTrue(edge['directed'])
+      self.assertEqual(edge['labels'], ['Performer'])
+
+  def testExpandLimit(self):
+    e = self.graph.expand(ALICE, limit=1)
+    self.assertLen(e['nodes'], 1)
+    self.assertTrue(e['truncated'])
+
   # HTTP API
 
   def testMqlread(self):
@@ -341,6 +409,25 @@ class ServerTest(GraphdTestCase):
     status, body = self.get_json('/api/search', q='testers')
     self.assertEqual(status, 200)
     self.assertEqual([r['id'] for r in body['result']], [BAND])
+
+  def testGraphApis(self):
+    status, body = self.get_json('/api/relations', id=ALICE)
+    self.assertEqual(status, 200)
+    self.assertEqual(body['relations'][0]['label'], 'Direct links')
+    status, body = self.get_json('/api/expand', id=ALICE,
+                                 via='/t/song/performer',
+                                 to='/t/song/performer')
+    self.assertEqual(status, 200)
+    self.assertEqual([n['id'] for n in body['nodes']], [BOB])
+
+    for params, status in [({'id': '/en/no_such_thing'}, 404),
+                           ({'id': ALICE, 'via': '/t/song/performer'}, 400),
+                           ({'id': ALICE, 'limit': 'many'}, 400),
+                           ({}, 400)]:
+      self.assertEqual(self.get_json('/api/expand', **params)[0], status,
+                       params)
+    self.assertEqual(self.get_json('/api/relations',
+                                   id='/en/no_such_thing')[0], 404)
 
   def testUnknownApi(self):
     status, body = self.get_json('/api/nope')
@@ -413,7 +500,8 @@ class NginxTest(GraphdTestCase):
     status, body = self.get('/')
     self.assertEqual(status, 200)
     self.assertIn(b'<script src="/app.js">', body)
-    for path in ('/app.js', '/style.css'):
+    for path in ('/app.js', '/graph.js', '/style.css',
+                 '/vendor/vis-network.min.js'):
       self.assertEqual(self.get(path)[0], 200, path)
 
   def testUnknownPagesGetTheBrowser(self):

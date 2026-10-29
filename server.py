@@ -3,6 +3,8 @@
   GET /api/mqlread?query=JSON[&cursor=C]   run an MQL read
   GET /api/topic?id=ID                     everything about one object
   GET /api/search?q=TEXT                   objects whose names match
+  GET /api/relations?id=ID                 ways to expand ID in a graph
+  GET /api/expand?id=ID[&via=P&to=Q]       ID's neighbours in a graph
 
 Replies are JSON. mqlread follows Freebase's API: {"code":
 "/api/status/ok", "result": ..., "cursor": ...}, or on error {"code":
@@ -29,6 +31,11 @@ from pymql.mql import graph
 LINK_LIMIT = 500
 # Most instances shown for a type.
 INSTANCE_LIMIT = 100
+
+# Expanding a node in the graph view follows at most this many links
+# into it (papers by an author, say), and returns this many neighbours.
+EXPAND_VIA_LIMIT = 1000
+EXPAND_NODE_LIMIT = 200
 
 # Links shown elsewhere on the page, or not interesting.
 HIDDEN_LINKS = {
@@ -182,6 +189,128 @@ class Graph(object):
         'instance_count': count,
     }
 
+  def node(self, id):
+    """An object as a graph node: id, name and type ids."""
+    obj, _ = self.read({'id': id, 'name': None, 'type': []})
+    if obj is None:
+      raise NotFound('no object with id %s' % id)
+    return {'id': obj['id'], 'name': obj['name'], 'types': obj['type']}
+
+  def relations(self, id):
+    """The ways to expand id in the graph view.
+
+    Its direct links; and, for each property P linking objects M to id
+    (/dblp/publication/author: papers by an author), each property Q of
+    P's type linking M to other objects (author again: co-authors; or
+    part_of: the proceedings the author's papers are in). Q's targets are
+    connected to id through the Ms, weighted by how many.
+    """
+    self.node(id)
+    incoming, _ = self.read({'id': id, '/type/reflect/any_reverse': [{
+        'link': None, 'limit': LINK_LIMIT, 'optional': True}]})
+    counts = {}
+    for l in incoming['/type/reflect/any_reverse']:
+      if l['link'] not in HIDDEN_LINKS:
+        counts[l['link']] = counts.get(l['link'], 0) + 1
+    props = self.properties(set(counts))
+
+    relations = [{'label': 'Direct links', 'via': None, 'to': None}]
+    for via in sorted(counts, key=lambda p: -counts[p]):
+      p = props.get(via)
+      if not p or not p['schema']:
+        continue
+      targets, _ = self.read([{
+          'type': '/type/property',
+          'schema': {'id': p['schema']['id']},
+          'id': None,
+          'name': None,
+          'unique': None,
+          'expected_type': {'id': None, 'optional': True},
+          'limit': 1000,
+      }])
+      for q in sorted(targets, key=lambda q: q['id'] != via):
+        expected = q['expected_type'] and q['expected_type']['id']
+        if not expected or expected.startswith('/type/'):
+          continue  # a value, not an object
+        relations.append({
+            'label': '%s of, then %s' % (p['name'], q['name']),
+            'via': via,
+            'to': q['id'],
+            'unique': bool(q['unique']),
+            'count': counts[via],
+        })
+    return {'relations': relations}
+
+  def expand(self, id, via=None, to=None, limit=EXPAND_NODE_LIMIT):
+    """id's neighbours, as {"center", "nodes", "edges"}.
+
+    Without via, its direct links, each an edge labelled by property and
+    pointing the way the link does ("directed": true). With via and to,
+    the objects reached through objects M that link to id by via and from
+    M to them by to; an edge's weight is the number of Ms.
+    """
+    center = self.node(id)
+    nodes, edges = {}, {}
+
+    def add(n, label, incoming=False):
+      if n['id'] == id:
+        return
+      nodes[n['id']] = {'id': n['id'], 'name': n['name'],
+                        'types': n.get('type', [])}
+      e = edges.setdefault((n['id'], incoming), {
+          'from': n['id'] if incoming else id,
+          'to': id if incoming else n['id'],
+          'weight': 0,
+          'labels': set(),
+          'directed': not via,
+      })
+      e['weight'] += 1
+      e['labels'].add(label)
+
+    if not via:
+      link = {'link': None, 'id': None, 'name': None, 'type': [],
+              'limit': LINK_LIMIT, 'optional': True}
+      result, _ = self.read({'id': id,
+                             '/type/reflect/any_master': [link],
+                             '/type/reflect/any_reverse': [dict(link)]})
+      links = ([(l, False) for l in result['/type/reflect/any_master']] +
+               [(l, True) for l in result['/type/reflect/any_reverse']])
+      links = [(l, i) for l, i in links if l['link'] not in HIDDEN_LINKS]
+      names = self.properties({l['link'] for l, _ in links})
+      for l, incoming in links:
+        p = names.get(l['link'])
+        add(l, p['name'] if p else l['link'], incoming)
+      middles = 0
+    else:
+      if not to:
+        raise BadRequest('expand with via also needs to')
+      result, _ = self.read({'id': id, '!' + via: [{
+          'id': None,
+          to: [{'id': None, 'name': None, 'type': [], 'optional': True,
+                'limit': EXPAND_NODE_LIMIT}],
+          'limit': EXPAND_VIA_LIMIT,
+          'optional': True,
+      }]})
+      middles = result['!' + via]
+      names = self.properties({to})
+      label = names[to]['name'] if to in names else to
+      for m in middles:
+        for n in m[to]:
+          add(n, label)
+      middles = len(middles)
+
+    weight = lambda n: sum(e['weight'] for (m, _), e in edges.items()
+                           if m == n)
+    chosen = set(sorted(nodes, key=lambda n: -weight(n))[:limit])
+    return {
+        'center': center,
+        'nodes': [nodes[n] for n in nodes if n in chosen],
+        'edges': [dict(e, labels=sorted(e['labels']))
+                  for (n, _), e in edges.items() if n in chosen],
+        'via_count': middles,
+        'truncated': len(nodes) > limit or middles == EXPAND_VIA_LIMIT,
+    }
+
   def search(self, text):
     words = text.split()
     if not words:
@@ -245,10 +374,26 @@ def search(params):
   return {'result': get_graph().search(params.get('q', ''))}
 
 
+def relations(params):
+  return get_graph().relations(required(params, 'id'))
+
+
+def expand(params):
+  try:
+    limit = int(params.get('limit', EXPAND_NODE_LIMIT))
+  except ValueError:
+    raise BadRequest('limit must be a number')
+  return get_graph().expand(required(params, 'id'), params.get('via') or None,
+                            params.get('to') or None,
+                            max(1, min(limit, EXPAND_NODE_LIMIT)))
+
+
 ROUTES = {
     '/api/mqlread': mqlread,
     '/api/topic': topic,
     '/api/search': search,
+    '/api/relations': relations,
+    '/api/expand': expand,
 }
 
 STATUS_TEXT = {

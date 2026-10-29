@@ -13,6 +13,8 @@ the objects that link to it.
   - `GET /api/topic?id=ID`: everything the browser shows for an object
   - `GET /api/search?q=TEXT`: objects whose names match, the last word as
     a prefix
+  - `GET /api/relations?id=ID` and `GET /api/expand?id=ID[&via=P&to=Q]`:
+    an object's neighbours, for the graph view
 - `static/` is the browser, a single page using those APIs.
 - nginx serves `static/` and passes `/api/` to gunicorn over a Unix
   socket (`nginx.conf.in`).
@@ -54,5 +56,18 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
 - `#/search/TEXT`: name search. Entering an id (`/en/...` or a `#guid`)
   in the search box goes straight to the object.
 - `#/query`: an MQL query editor; ids in the results link to their pages.
+- `#/graph/ID`: a graph of objects and the links between them, drawn
+  with [vis-network](https://visjs.github.io/vis-network/) (9.1.9, in
+  `static/vendor/`). Double-click a node to expand it (or contract it
+  again); delete nodes, cluster a node's neighbours, and hide edges below
+  a weight. A node expands by one of its relations:
+  - its direct links, as arrows the way the links point; or
+  - the objects reached through the objects linking to it, weighted by
+    how many: through `/dblp/publication/author`, an author's co-authors
+    ("Author of, then Author"), or the proceedings their papers are in
+    ("Author of, then Part of"); a proceedings' authors ("Part of, then
+    Author"); a paper's co-cited papers ("Cites of, then Cites").
+
+  Double-clicking uses a co-relation like co-authors where there is one.
 
 The service is read-only, and it listens only on 127.0.0.1.

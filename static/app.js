@@ -3,6 +3,7 @@
 //   #/view/<id>     an object
 //   #/search/<text> name search
 //   #/query         MQL query editor
+//   #/graph/<id>    graph view (graph.js)
 'use strict';
 
 const main = document.getElementById('main');
@@ -116,7 +117,8 @@ async function showTopic(id) {
     el('div', {class: 'ids mono'},
       el('span', {}, t.id),
       el('span', {}, t.guid),
-      t.timestamp && el('span', {}, t.timestamp)),
+      t.timestamp && el('span', {}, t.timestamp),
+      el('a', {href: graphHref(t.id)}, 'Graph')),
     el('div', {class: 'chips'}, t.types.map(ty =>
       el('a', {class: 'chip', href: viewHref(ty.id), title: ty.id}, ty.name || ty.id))),
     t.keys.length > 1 && el('p', {class: 'note'}, 'Keys: ',
@@ -265,10 +267,12 @@ async function route() {
   const hash = location.hash.replace(/^#/, '') || '/';
   const [, page, ...rest] = hash.split('/');
   const arg = decodeURIComponent(rest.join('/'));
+  main.classList.toggle('wide', page === 'graph');
   try {
     if (page === 'view' && arg) await showTopic(arg);
     else if (page === 'search' && arg) await showSearch(arg);
     else if (page === 'query') showQuery();
+    else if (page === 'graph') await showGraph(arg || null);
     else showHome();
   } catch (e) {
     showError(e);
