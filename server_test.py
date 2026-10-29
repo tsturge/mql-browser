@@ -1,5 +1,8 @@
 """Tests for server.py against a graphd started for the test.
 
+ServerTest serves the WSGI application with wsgiref; NginxTest runs
+run.sh, with nginx and gunicorn, and is skipped without them.
+
 The graphd binary is --graphd_binary, else $GRAPHD, else
 ../graphd/out/bin/graphd beside this repository; the tests are skipped
 without one. pymql must be importable (PYTHONPATH=..):
@@ -10,8 +13,10 @@ without one. pymql must be importable (PYTHONPATH=..):
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,6 +24,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import wsgiref.simple_server
 
 from absl import flags
 from absl.testing import absltest
@@ -54,6 +60,30 @@ def _free_port():
   port = s.getsockname()[1]
   s.close()
   return port
+
+
+def _wait_for_port(port, process, what, timeout=10):
+  deadline = time.time() + timeout
+  while True:
+    try:
+      socket.create_connection(('127.0.0.1', port), 0.1).close()
+      return
+    except OSError:
+      if process.poll() is not None or time.time() > deadline:
+        raise RuntimeError('%s did not start' % what)
+      time.sleep(0.05)
+
+
+def _get(port, path, **params):
+  """GETs path from 127.0.0.1:port; returns (status, body bytes)."""
+  url = 'http://127.0.0.1:%d%s' % (port, path)
+  if params:
+    url += '?' + urllib.parse.urlencode(params)
+  try:
+    with urllib.request.urlopen(url) as r:
+      return r.status, r.read()
+  except urllib.error.HTTPError as e:
+    return e.code, e.read()
 
 
 def _text(value):
@@ -99,11 +129,12 @@ def load_test_data(conn):
     }, **ROOT)
 
 
-class ServerTest(absltest.TestCase):
+class GraphdTestCase(absltest.TestCase):
+  """Starts a bootstrapped graphd holding the test data."""
 
   @classmethod
   def setUpClass(cls):
-    super(ServerTest, cls).setUpClass()
+    super(GraphdTestCase, cls).setUpClass()
     if not os.access(FLAGS.graphd_binary, os.X_OK):
       raise unittest.SkipTest('no graphd binary at %s' % FLAGS.graphd_binary)
 
@@ -116,17 +147,8 @@ class ServerTest(absltest.TestCase):
          '-p', os.path.join(cls.tmpdir, 'graphd.pid'),
          '-i', 'tcp://127.0.0.1:%d' % port],
         cwd=cls.tmpdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    cls.http = None
     try:
-      deadline = time.time() + 10
-      while True:
-        try:
-          socket.create_connection(('127.0.0.1', port), 0.1).close()
-          break
-        except OSError:
-          if cls.graphd.poll() is not None or time.time() > deadline:
-            raise RuntimeError('graphd did not start')
-          time.sleep(0.05)
+      _wait_for_port(port, cls.graphd, 'graphd')
 
       conn = graph.TcpGraphConnector(addrs=[('127.0.0.1', port)])
       boot = bootstrap.Bootstrap(conn)
@@ -136,44 +158,51 @@ class ServerTest(absltest.TestCase):
       boot.load_root_user()
       boot.load_object_hints()
       load_test_data(conn)
-
-      cls.graph = server.Graph('127.0.0.1:%d' % port)
-      cls.start_http(cls.graph)
+      cls.graphd_addr = '127.0.0.1:%d' % port
     except:
-      cls.stop()
+      cls.stop_graphd()
       raise
 
   @classmethod
-  def start_http(cls, graph_):
-    server.Handler.graph = graph_
-    cls.http = server.http.server.ThreadingHTTPServer(
-        ('127.0.0.1', 0), server.Handler)
-    threading.Thread(target=cls.http.serve_forever, daemon=True).start()
-
-  @classmethod
   def tearDownClass(cls):
-    cls.stop()
-    super(ServerTest, cls).tearDownClass()
+    cls.stop_graphd()
+    super(GraphdTestCase, cls).tearDownClass()
 
   @classmethod
-  def stop(cls):
-    if cls.http:
-      cls.http.shutdown()
-      cls.http.server_close()
+  def stop_graphd(cls):
     cls.graphd.terminate()
     cls.graphd.wait()
     shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
+
+class QuietHandler(wsgiref.simple_server.WSGIRequestHandler):
+
+  def log_message(self, *args):
+    pass
+
+
+class ServerTest(GraphdTestCase):
+  """The Graph class, and the WSGI application served by wsgiref."""
+
+  @classmethod
+  def setUpClass(cls):
+    super(ServerTest, cls).setUpClass()
+    os.environ['GRAPHD_ADDR'] = cls.graphd_addr
+    server._graph = None
+    cls.graph = server.get_graph()
+    cls.http = wsgiref.simple_server.make_server(
+        '127.0.0.1', 0, server.application, handler_class=QuietHandler)
+    threading.Thread(target=cls.http.serve_forever, daemon=True).start()
+
+  @classmethod
+  def tearDownClass(cls):
+    cls.http.shutdown()
+    cls.http.server_close()
+    server._graph = None
+    super(ServerTest, cls).tearDownClass()
+
   def get(self, path, **params):
-    """GETs path from the server; returns (status, body bytes)."""
-    url = 'http://127.0.0.1:%d%s' % (self.http.server_address[1], path)
-    if params:
-      url += '?' + urllib.parse.urlencode(params)
-    try:
-      with urllib.request.urlopen(url) as r:
-        return r.status, r.read()
-    except urllib.error.HTTPError as e:
-      return e.code, e.read()
+    return _get(self.http.server_address[1], path, **params)
 
   def get_json(self, path, **params):
     status, body = self.get(path, **params)
@@ -318,7 +347,67 @@ class ServerTest(absltest.TestCase):
     self.assertEqual(status, 404)
     self.assertEqual(body['code'], '/api/status/error')
 
-  # Static files
+  def testOnlyGet(self):
+    url = 'http://127.0.0.1:%d/api/search' % self.http.server_address[1]
+    req = urllib.request.Request(url, data=b'q=x', method='POST')
+    with self.assertRaises(urllib.error.HTTPError) as e:
+      urllib.request.urlopen(req)
+    self.assertEqual(e.exception.code, 405)
+
+  def testStaticFilesAreNotServed(self):
+    # nginx serves static/; the application only answers /api/.
+    self.assertEqual(self.get('/')[0], 404)
+    self.assertEqual(self.get('/app.js')[0], 404)
+
+
+class NginxTest(GraphdTestCase):
+  """run.sh: nginx serving static/ and proxying /api/ to gunicorn."""
+
+  @classmethod
+  def setUpClass(cls):
+    nginx = shutil.which('nginx') or '/opt/homebrew/bin/nginx'
+    if not os.access(nginx, os.X_OK):
+      raise unittest.SkipTest('no nginx')
+    try:
+      import gunicorn  # pylint: disable=g-import-not-at-top,unused-import
+    except ImportError:
+      raise unittest.SkipTest('no gunicorn')
+    super(NginxTest, cls).setUpClass()
+    cls.port = _free_port()
+    # Not "cls.run": that would hide unittest.TestCase.run.
+    cls.run_log = os.path.join(cls.tmpdir, 'run.log')
+    env = dict(os.environ, PORT=str(cls.port), NGINX=nginx, WORKERS='2',
+               PYTHON=sys.executable, RUNDIR=os.path.join(cls.tmpdir, 'run'))
+    cls.run_sh = subprocess.Popen(
+        [os.path.join(_TOP, 'run.sh'), cls.graphd_addr], env=env,
+        stdout=subprocess.DEVNULL, stderr=open(cls.run_log, 'wb'),
+        start_new_session=True)
+    try:
+      _wait_for_port(cls.port, cls.run_sh, 'run.sh')
+      # nginx is up; wait for gunicorn behind it.
+      deadline = time.time() + 10
+      while _get(cls.port, '/api/search', q='x')[0] != 200:
+        if time.time() > deadline:
+          raise RuntimeError('gunicorn did not start')
+        time.sleep(0.1)
+    except:
+      cls.stop_run()
+      cls.stop_graphd()
+      raise
+
+  @classmethod
+  def tearDownClass(cls):
+    cls.stop_run()
+    super(NginxTest, cls).tearDownClass()
+
+  @classmethod
+  def stop_run(cls):
+    # run.sh, nginx and gunicorn are in their own process group.
+    os.killpg(cls.run_sh.pid, signal.SIGTERM)
+    cls.run_sh.wait()
+
+  def get(self, path, **params):
+    return _get(self.port, path, **params)
 
   def testStaticFiles(self):
     status, body = self.get('/')
@@ -327,10 +416,25 @@ class ServerTest(absltest.TestCase):
     for path in ('/app.js', '/style.css'):
       self.assertEqual(self.get(path)[0], 200, path)
 
+  def testUnknownPagesGetTheBrowser(self):
+    # The browser routes by URL hash, so any other path gets index.html.
+    status, body = self.get('/no/such/page')
+    self.assertEqual(status, 200)
+    self.assertIn(b'<script src="/app.js">', body)
+
+  def testApiIsProxied(self):
+    status, body = self.get('/api/mqlread',
+                            query=json.dumps({'id': BAND, 'name': None}))
+    self.assertEqual(status, 200)
+    self.assertEqual(json.loads(body)['result']['name'], 'The Testers')
+    status, body = self.get('/api/topic', id='/en/no_such_thing')
+    self.assertEqual(status, 404)
+    self.assertEqual(json.loads(body)['code'], '/api/status/error')
+
   def testStaticFilesStayInStatic(self):
-    self.assertEqual(self.get('/../server.py')[0], 404)
-    self.assertEqual(self.get('/%2e%2e/server.py')[0], 404)
-    self.assertEqual(self.get('/no_such_file.js')[0], 404)
+    for path in ('/../server.py', '/%2e%2e/server.py', '/static/../server.py'):
+      status, body = self.get(path)
+      self.assertNotIn(b'import', body, path)
 
 
 if __name__ == '__main__':

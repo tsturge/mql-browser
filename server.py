@@ -1,39 +1,29 @@
-"""A small web service around MQL, and a browser for the graph.
+"""A WSGI web service around MQL, for the MQL browser.
 
   GET /api/mqlread?query=JSON[&cursor=C]   run an MQL read
   GET /api/topic?id=ID                     everything about one object
   GET /api/search?q=TEXT                   objects whose names match
-  GET /                                    the browser (static/)
 
 Replies are JSON. mqlread follows Freebase's API: {"code":
 "/api/status/ok", "result": ..., "cursor": ...}, or on error {"code":
 "/api/status/error", "messages": [...]} with HTTP status 400.
 
-Usage: server.py --graphd_addr=host:port [--port=8080]
+It runs under gunicorn behind nginx, which serves the browser (static/);
+see run.sh. GRAPHD_ADDR (host:port) names the graphd:
+
+  GRAPHD_ADDR=localhost:8200 gunicorn server:application
 """
 
-import http.server
 import json
-import mimetypes
 import os
 import threading
 import urllib.parse
 
-from absl import app
 from absl import flags
 
 from pymql import MQLService
 from pymql.mql import error
 from pymql.mql import graph
-
-FLAGS = flags.FLAGS
-# pymql's bootstrap defines the same flag; the tests import both.
-if 'graphd_addr' not in FLAGS:
-  flags.DEFINE_string('graphd_addr', None, 'graphd address, host:port')
-flags.DEFINE_string('host', '127.0.0.1', 'address to listen on')
-flags.DEFINE_integer('port', 8080, 'port to listen on')
-
-STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 
 # Most links of one kind (outgoing, incoming, values) shown for an object.
 LINK_LIMIT = 500
@@ -208,86 +198,100 @@ class Graph(object):
     return result
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-  graph = None
-
-  def do_GET(self):
-    url = urllib.parse.urlparse(self.path)
-    params = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query, keep_blank_values=True).items()}
-    try:
-      if url.path == '/api/mqlread':
-        self.mqlread(params)
-      elif url.path == '/api/topic':
-        self.send_json(200, self.graph.topic(self.required(params, 'id')))
-      elif url.path == '/api/search':
-        self.send_json(200, {'result': self.graph.search(params.get('q', ''))})
-      elif url.path.startswith('/api/'):
-        raise NotFound('no such API: %s' % url.path)
-      else:
-        self.static(url.path)
-    except BadRequest as e:
-      self.send_json(400, {'code': '/api/status/error',
-                           'messages': [{'message': str(e)}]})
-    except NotFound as e:
-      self.send_json(404, {'code': '/api/status/error',
-                           'messages': [{'message': str(e)}]})
-    except error.MQLError as e:
-      self.send_json(400, {'code': '/api/status/error',
-                           'messages': [dict(e.error, message=str(e))]})
-
-  def required(self, params, name):
-    if name not in params:
-      raise BadRequest('missing parameter: %s' % name)
-    return params[name]
-
-  def mqlread(self, params):
-    try:
-      query = json.loads(self.required(params, 'query'))
-    except ValueError as e:
-      raise BadRequest('query is not valid JSON: %s' % e)
-    result, cursor = self.graph.read(query, params.get('cursor'))
-    self.send_json(200, {
-        'code': '/api/status/ok',
-        'result': result,
-        'cursor': cursor,
-    })
-
-  def static(self, path):
-    if path == '/':
-      path = '/index.html'
-    file = os.path.normpath(os.path.join(STATIC, path.lstrip('/')))
-    if not file.startswith(STATIC + os.sep) or not os.path.isfile(file):
-      raise NotFound('no such page: %s' % path)
-    with open(file, 'rb') as f:
-      body = f.read()
-    self.send_response(200)
-    self.send_header('Content-Type',
-                     mimetypes.guess_type(file)[0] or 'application/octet-stream')
-    self.send_header('Content-Length', str(len(body)))
-    self.end_headers()
-    self.wfile.write(body)
-
-  def send_json(self, status, obj):
-    body = json.dumps(obj, indent=1, ensure_ascii=False, default=str).encode()
-    self.send_response(status)
-    self.send_header('Content-Type', 'application/json; charset=utf-8')
-    self.send_header('Content-Length', str(len(body)))
-    self.end_headers()
-    self.wfile.write(body)
-
-  def log_message(self, fmt, *args):
-    pass
+_graph = None
+_graph_lock = threading.Lock()
 
 
-def main(argv):
-  if not FLAGS.graphd_addr:
-    raise app.UsageError('--graphd_addr is required')
-  Handler.graph = Graph(FLAGS.graphd_addr)
-  server = http.server.ThreadingHTTPServer((FLAGS.host, FLAGS.port), Handler)
-  print('serving http://%s:%d/ for graphd %s' %
-        (FLAGS.host, FLAGS.port, FLAGS.graphd_addr), flush=True)
-  server.serve_forever()
+def get_graph():
+  """The process's Graph, made on first use (after gunicorn forks)."""
+  global _graph
+  with _graph_lock:
+    if _graph is None:
+      # pymql reads its settings from absl flags, which are normally
+      # parsed by absl's app.run(); under a WSGI server, use defaults.
+      if not flags.FLAGS.is_parsed():
+        flags.FLAGS(['server'])
+      addr = os.environ.get('GRAPHD_ADDR')
+      if not addr:
+        raise RuntimeError('GRAPHD_ADDR is not set')
+      _graph = Graph(addr)
+    return _graph
 
 
-if __name__ == '__main__':
-  app.run(main)
+def required(params, name):
+  if name not in params:
+    raise BadRequest('missing parameter: %s' % name)
+  return params[name]
+
+
+def mqlread(params):
+  try:
+    query = json.loads(required(params, 'query'))
+  except ValueError as e:
+    raise BadRequest('query is not valid JSON: %s' % e)
+  result, cursor = get_graph().read(query, params.get('cursor'))
+  return {
+      'code': '/api/status/ok',
+      'result': result,
+      'cursor': cursor,
+  }
+
+
+def topic(params):
+  return get_graph().topic(required(params, 'id'))
+
+
+def search(params):
+  return {'result': get_graph().search(params.get('q', ''))}
+
+
+ROUTES = {
+    '/api/mqlread': mqlread,
+    '/api/topic': topic,
+    '/api/search': search,
+}
+
+STATUS_TEXT = {
+    200: 'OK',
+    400: 'Bad Request',
+    404: 'Not Found',
+    405: 'Method Not Allowed',
+}
+
+
+def error_reply(message):
+  return {'code': '/api/status/error', 'messages': [{'message': message}]}
+
+
+def application(environ, start_response):
+  """The WSGI entry point."""
+  path = environ.get('PATH_INFO', '')
+  # keep_blank_values: "cursor=" (start paging) must not be dropped.
+  params = {
+      k: v[-1] for k, v in urllib.parse.parse_qs(
+          environ.get('QUERY_STRING', ''), keep_blank_values=True).items()
+  }
+  try:
+    if environ['REQUEST_METHOD'] not in ('GET', 'HEAD'):
+      status, body = 405, error_reply('only GET is supported')
+    elif path not in ROUTES:
+      raise NotFound('no such API: %s' % path)
+    else:
+      status, body = 200, ROUTES[path](params)
+  except BadRequest as e:
+    status, body = 400, error_reply(str(e))
+  except NotFound as e:
+    status, body = 404, error_reply(str(e))
+  except error.MQLError as e:
+    status, body = 400, {
+        'code': '/api/status/error',
+        'messages': [dict(e.error, message=str(e))],
+    }
+  data = json.dumps(body, indent=1, ensure_ascii=False, default=str).encode()
+  start_response('%d %s' % (status, STATUS_TEXT[status]), [
+      ('Content-Type', 'application/json; charset=utf-8'),
+      ('Content-Length', str(len(data))),
+  ])
+  if environ['REQUEST_METHOD'] == 'HEAD':
+    return [b'']
+  return [data]

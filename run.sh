@@ -1,49 +1,65 @@
 #!/bin/bash
 #
-# run.sh -- run the MQL browser: server.py for /api/, nginx in front.
+# run.sh -- run the MQL browser: server.py under gunicorn, nginx in front.
 #
-#   ./run.sh --graphd_addr=localhost:8200
+#   ./run.sh localhost:8200        (the graphd to read from)
+#
+# nginx serves static/ and passes /api/ to gunicorn on a Unix socket.
 #
 # Environment:
-#   PORT       port nginx listens on (default 8080)
-#   API_PORT   port server.py listens on (default 8081)
-#   NGINX      nginx binary (default: nginx on PATH)
-#   PYTHON     Python with pymql's dependencies (default: python3)
+#   PORT          port nginx listens on (default 8080)
+#   WORKERS       gunicorn worker processes (default 4)
+#   NGINX         nginx binary (default: nginx on PATH, or Homebrew's)
+#   PYTHON        Python with pymql's dependencies and gunicorn
+#                 (default: python3)
 #   PYMQL_PARENT  directory holding the pymql checkout (default: ..)
-#   RUNDIR     nginx's working directory (default: ./run)
+#   RUNDIR        working directory for nginx and gunicorn (default: ./run)
 #
 # Both stop on Ctrl-C.
 
 set -eu
 
+if [ $# -ne 1 ]; then
+  echo "usage: $0 graphd-host:port" >&2
+  exit 2
+fi
+
 top=$(cd "$(dirname "$0")" && pwd)
 port=${PORT:-8080}
-api_port=${API_PORT:-8081}
-nginx=${NGINX:-nginx}
+workers=${WORKERS:-4}
 python=${PYTHON:-python3}
 pymql_parent=$(cd "${PYMQL_PARENT:-$top/..}" && pwd)
 rundir=${RUNDIR:-$top/run}
+nginx=${NGINX:-$(command -v nginx || echo /opt/homebrew/bin/nginx)}
 
-if ! command -v "$nginx" > /dev/null; then
+if [ ! -x "$nginx" ]; then
   echo "$0: no nginx; install it (brew install nginx) or set NGINX" >&2
+  exit 2
+fi
+if ! "$python" -c 'import gunicorn' 2> /dev/null; then
+  echo "$0: $python has no gunicorn; pip install gunicorn" >&2
   exit 2
 fi
 
 mkdir -p "$rundir/conf" "$rundir/logs" "$rundir/tmp"
+socket=$rundir/api.sock
 sed -e "s|@STATIC@|$top/static|" \
     -e "s|@PORT@|$port|" \
-    -e "s|@API_PORT@|$api_port|" \
+    -e "s|@API_SOCKET@|$socket|" \
     "$top/nginx.conf.in" > "$rundir/conf/nginx.conf"
 "$nginx" -t -q -p "$rundir" -c conf/nginx.conf
 
-PYTHONPATH="$pymql_parent" "$python" "$top/server.py" \
-    --host=127.0.0.1 --port="$api_port" "$@" &
+GRAPHD_ADDR=$1 PYTHONPATH="$pymql_parent" "$python" -m gunicorn \
+    --bind "unix:$socket" --workers "$workers" --chdir "$top" \
+    --access-logfile "$rundir/logs/api-access.log" \
+    --error-logfile "$rundir/logs/api-error.log" \
+    server:application &
 api_pid=$!
 "$nginx" -p "$rundir" -c conf/nginx.conf &
 nginx_pid=$!
 trap 'kill $api_pid $nginx_pid 2> /dev/null' EXIT INT TERM
 
-echo "MQL browser on http://127.0.0.1:$port/"
+echo "MQL browser on http://127.0.0.1:$port/ (graphd $1)"
 # Until either one exits (macOS's bash 3.2 has no "wait -n").
 while kill -0 $api_pid 2> /dev/null && kill -0 $nginx_pid 2> /dev/null; do
   sleep 1
