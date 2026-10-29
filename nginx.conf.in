@@ -1,0 +1,54 @@
+# nginx config for the MQL browser; run.sh fills in @STATIC@, @PORT@ and
+# @API_PORT@ and runs nginx with this directory's copy as its prefix.
+#
+# nginx serves the browser's static files and passes /api/ to server.py.
+
+worker_processes 1;
+daemon off;
+error_log logs/error.log;
+pid logs/nginx.pid;
+
+events {
+  worker_connections 256;
+}
+
+http {
+  types {
+    text/html html;
+    text/css css;
+    application/javascript js;
+    application/json json;
+    image/png png;
+    image/svg+xml svg;
+  }
+  default_type application/octet-stream;
+  charset utf-8;
+  charset_types application/javascript text/css;
+
+  access_log logs/access.log;
+  client_body_temp_path tmp/client;
+  proxy_temp_path tmp/proxy;
+  fastcgi_temp_path tmp/fastcgi;
+  uwsgi_temp_path tmp/uwsgi;
+  scgi_temp_path tmp/scgi;
+
+  sendfile on;
+  gzip on;
+  gzip_types application/json application/javascript text/css;
+
+  server {
+    listen 127.0.0.1:@PORT@;
+    root @STATIC@;
+
+    location / {
+      try_files $uri /index.html;
+    }
+
+    location /api/ {
+      proxy_pass http://127.0.0.1:@API_PORT@;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_read_timeout 120s;
+    }
+  }
+}

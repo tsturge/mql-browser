@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# nginx config, logs and temporary files written by run.sh
+run/
