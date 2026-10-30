@@ -17,7 +17,7 @@ function el(tag, attrs, ...children) {
     else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
     else e.setAttribute(k, v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c === null || c === undefined || c === false) continue;
     e.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
