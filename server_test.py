@@ -519,6 +519,23 @@ class NginxTest(GraphdTestCase):
     self.assertEqual(status, 404)
     self.assertEqual(json.loads(body)['code'], '/api/status/error')
 
+  def testManual(self):
+    manual = os.path.join(_CODE, 'mql-manual', 'html')
+    if not os.path.isdir(manual):
+      self.skipTest('no mql-manual checkout beside this one')
+    status, body = self.get('/manual/')
+    self.assertEqual(status, 200)
+    self.assertIn(b'MQL Reference Guide', body)
+    self.assertIn(b'href="ch03.html', body)
+    for path in ('/manual/ch03.html', '/manual/files/stylesheet.css',
+                 '/manual/files/logo-mqlreference.png'):
+      self.assertEqual(self.get(path)[0], 200, path)
+    # urllib follows the redirect from /manual to /manual/.
+    status, body = self.get('/manual')
+    self.assertEqual(status, 200)
+    self.assertIn(b'MQL Reference Guide', body)
+    self.assertEqual(self.get('/manual/no_such_page.html')[0], 404)
+
   def testStaticFilesStayInStatic(self):
     for path in ('/../server.py', '/%2e%2e/server.py', '/static/../server.py'):
       status, body = self.get(path)

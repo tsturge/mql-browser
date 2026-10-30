@@ -13,6 +13,8 @@
 #   PYTHON        Python with pymql's dependencies and gunicorn
 #                 (default: python3)
 #   PYMQL_PARENT  directory holding the pymql checkout (default: ..)
+#   MANUAL        the MQL manual's HTML, served at /manual/
+#                 (default: ../mql-manual/html)
 #   RUNDIR        working directory for nginx and gunicorn (default: ./run)
 #
 # Both stop on Ctrl-C.
@@ -30,6 +32,8 @@ workers=${WORKERS:-4}
 python=${PYTHON:-python3}
 pymql_parent=$(cd "${PYMQL_PARENT:-$top/..}" && pwd)
 rundir=${RUNDIR:-$top/run}
+manual=${MANUAL:-$top/../mql-manual/html}
+manual=$(cd "$manual" 2> /dev/null && pwd || echo "$manual")
 nginx=${NGINX:-$(command -v nginx || echo /opt/homebrew/bin/nginx)}
 
 if [ ! -x "$nginx" ]; then
@@ -46,6 +50,7 @@ socket=$rundir/api.sock
 sed -e "s|@STATIC@|$top/static|" \
     -e "s|@PORT@|$port|" \
     -e "s|@API_SOCKET@|$socket|" \
+    -e "s|@MANUAL@|$manual|" \
     "$top/nginx.conf.in" > "$rundir/conf/nginx.conf"
 "$nginx" -t -q -p "$rundir" -c conf/nginx.conf
 

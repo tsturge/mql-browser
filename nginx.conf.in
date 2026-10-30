@@ -1,8 +1,9 @@
-# nginx config for the MQL browser; run.sh fills in @STATIC@, @PORT@ and
-# @API_SOCKET@ and runs nginx with its run directory as the prefix.
+# nginx config for the MQL browser; run.sh fills in @STATIC@, @PORT@,
+# @API_SOCKET@ and @MANUAL@ and runs nginx with its run directory as the
+# prefix.
 #
-# nginx serves the browser's static files and passes /api/ to server.py,
-# running under gunicorn on a Unix socket.
+# nginx serves the browser's static files, the MQL manual under /manual/,
+# and passes /api/ to server.py, running under gunicorn on a Unix socket.
 
 worker_processes 1;
 daemon off;
@@ -47,6 +48,15 @@ http {
 
     location / {
       try_files $uri /index.html;
+    }
+
+    location = /manual {
+      return 301 /manual/;
+    }
+
+    location /manual/ {
+      alias @MANUAL@/;
+      index index.html;
     }
 
     location /api/ {
