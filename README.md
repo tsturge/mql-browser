@@ -17,7 +17,8 @@ the objects that link to it.
     an object's neighbours, for the graph view
 - `static/` is the browser, a single page using those APIs.
 - nginx serves `static/` and passes `/api/` to gunicorn over a Unix
-  socket (`nginx.conf.in`).
+  socket (`nginx.conf.in`). It also serves the MQL manual, from the
+  [mql-manual](../mql-manual) checkout beside this one, at `/manual/`.
 
 ## Running
 
@@ -33,7 +34,8 @@ MQL browser on http://127.0.0.1:8080/ (graphd localhost:8200)
 
 It writes nginx's config, both servers' logs and gunicorn's socket under
 `run/`, and stops both servers on Ctrl-C. `PORT` changes nginx's port
-(8080) and `WORKERS` the number of gunicorn workers (4).
+(8080), `WORKERS` the number of gunicorn workers (4), and `MANUAL` where
+the manual's HTML is (`../mql-manual/html`).
 
 ## Tests
 
