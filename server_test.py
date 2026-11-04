@@ -318,6 +318,67 @@ class ServerTest(GraphdTestCase):
     self.assertEqual(self.graph.search('   '), [])
     self.assertEqual(self.graph.search('zzzzqq'), [])
 
+  def testPathByRelation(self):
+    # Alice and Bob sing two duets together.
+    via = '/t/song/performer'
+    r = self.graph.path(ALICE, BOB, via, via)
+    self.assertTrue(r['found'])
+    self.assertEqual([n['id'] for n in r['nodes']], [ALICE, BOB])
+    [step] = r['steps']
+    self.assertEqual(step['label'], 'Performer of, then Performer')
+    self.assertEqual(r['relation']['via_name'], 'Performer')
+    self.assertEqual(step['shared'], 2)
+    self.assertCountEqual([m['name'] for m in step['middles']],
+                          ['Duet', 'Duet Again'])
+    # The band has no performers: no path.
+    r = self.graph.path(ALICE, BAND, via, via)
+    self.assertFalse(r['found'])
+    self.assertEqual(r['reason'], 'not connected')
+    self.assertEqual(self.graph.path(ALICE, ALICE, via, via)['nodes'],
+                     [{'id': ALICE, 'name': 'Alice', 'types': ['/t/singer']}])
+
+  def testPathByDirectLinks(self):
+    # Solo -> Alice <- a duet -> Bob; links count either way.
+    r = self.graph.path('/en/solo', BOB)
+    self.assertTrue(r['found'])
+    ids = [n['id'] for n in r['nodes']]
+    self.assertEqual(ids[:2], ['/en/solo', ALICE])
+    self.assertIn(ids[2], ['/en/duet', '/en/duet_2'])
+    self.assertEqual(ids[3], BOB)
+    self.assertEqual([s['property'] for s in r['steps']], [
+        '/t/song/performer'] * 3)
+    self.assertEqual([s['label'] for s in r['steps']], ['Performer'] * 3)
+    # Songs link to their performers.
+    self.assertEqual([s['forward'] for s in r['steps']], [True, False, True])
+    # Albums and their band; not through types, keys or permissions,
+    # which every object has.
+    r = self.graph.path(FIRST, SECOND)
+    self.assertEqual([n['id'] for n in r['nodes']], [FIRST, BAND, SECOND])
+    self.assertFalse(self.graph.path(ALICE, BAND)['found'])
+
+  def testPathSplitsReadsGraphdWouldCut(self):
+    # Pretend graphd returns at most two results, one object a read.
+    old = server.GRAPHD_RESULT_CAP, server.PATH_CHUNK
+    server.GRAPHD_RESULT_CAP, server.PATH_CHUNK = 2, 3
+    try:
+      r = self.graph.path('/en/solo', BOB)
+    finally:
+      server.GRAPHD_RESULT_CAP, server.PATH_CHUNK = old
+    self.assertLen(r['nodes'], 4)
+
+  def testPathErrors(self):
+    with self.assertRaises(server.NotFound):
+      self.graph.path(ALICE, '/en/nobody')
+    with self.assertRaises(server.BadRequest):
+      self.graph.path(ALICE, BOB, '/t/song/performer', None)
+    status, body = self.get_json('/api/path', a=ALICE, b=BOB,
+                                 via='/t/song/performer',
+                                 to='/t/song/performer')
+    self.assertEqual(status, 200)
+    self.assertEqual(body['steps'][0]['shared'], 2)
+    status, body = self.get_json('/api/path', a=ALICE)
+    self.assertEqual(status, 400)
+
   def testRelations(self):
     rels = self.graph.relations(ALICE)['relations']
     self.assertEqual(rels[0], {'label': 'Direct links', 'via': None, 'to': None})

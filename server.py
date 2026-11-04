@@ -7,6 +7,7 @@
   GET /api/search?q=TEXT                   objects whose names match
   GET /api/relations?id=ID                 ways to expand ID in a graph
   GET /api/expand?id=ID[&via=P&to=Q]       ID's neighbours in a graph
+  GET /api/path?a=ID&b=ID[&via=P&to=Q]     a shortest path between two
 
 Replies are JSON. mqlread follows Freebase's API: {"code":
 "/api/status/ok", "result": ..., "cursor": ...}, or on error {"code":
@@ -24,6 +25,8 @@ see run.sh. GRAPHD_ADDR (host:port) names the graphd:
 
 import json
 import os
+import re
+import socket
 import threading
 import time
 import traceback
@@ -56,6 +59,20 @@ HIDDEN_LINKS = {
     '/type/object/permission',
     '/type/namespace/keys',
 }
+
+
+# Shortest paths: the search gives up past this many steps, objects
+# reached, or seconds.
+PATH_MAX_STEPS = 10
+PATH_MAX_VISITED = 2000000
+PATH_SECONDS = 60
+# graphd returns at most this many results to a read, silently dropping
+# the rest; the path search splits reads that reach it.
+GRAPHD_RESULT_CAP = 65536
+# Objects per graphd read in the path search, and the page size asked
+# for (more than graphd gives).
+PATH_CHUNK = 2000
+PATH_PAGESIZE = 1000000
 
 
 class BadRequest(Exception):
@@ -158,11 +175,70 @@ class TracingConnector(graph.TcpGraphConnector):
       entry['ms'] = (time.time() - start) * 1000
 
 
+class RawGraphd(object):
+  """A connection for flat graphd reads that return only guids.
+
+  The path search reads hundreds of thousands of links; through MQL,
+  building its nested results would take most of the time. This sends
+  graphd reads directly and pulls the guids out of the reply.
+  """
+
+  ROW = re.compile(r'\(([0-9a-f]{32}(?: (?:[0-9a-f]{32}|null))*)\)')
+
+  def __init__(self, addr, deadline):
+    host, port = addr.rsplit(':', 1)
+    self.deadline = deadline
+    self.sock = socket.create_connection((host, int(port)), timeout=10)
+    self.file = self.sock.makefile('rb')
+
+  def close(self):
+    self.file.close()
+    self.sock.close()
+
+  def read(self, constraint):
+    """Rows of guids (or None) from read <constraint>."""
+    left = self.deadline - time.time()
+    if left <= 0:
+      raise PathGiveUp('took more than %d seconds' % PATH_SECONDS)
+    self.sock.settimeout(left + 5)
+    self.sock.sendall(('read cost="tu=%d" %s\n' % (left * 1000, constraint))
+                      .encode())
+    line = self.file.readline().decode()
+    if line.startswith('error EMPTY'):
+      return []
+    if line.startswith('error TOOHARD'):
+      raise PathGiveUp('took more than %d seconds' % PATH_SECONDS)
+    if not line.startswith('ok '):
+      raise RuntimeError('graphd: %s' % line.strip()[:500])
+    return [[None if g == 'null' else g for g in row.split(' ')]
+            for row in self.ROW.findall(line)]
+
+  def read_for(self, guids, make_constraint):
+    """read() for each chunk of guids; make_constraint(guid list)."""
+    rows = []
+    pending = [guids[i:i + PATH_CHUNK]
+               for i in range(0, len(guids), PATH_CHUNK)]
+    while pending:
+      chunk = pending.pop()
+      result = self.read(make_constraint('(%s)' % ' '.join(chunk)))
+      if len(result) >= GRAPHD_RESULT_CAP and len(chunk) > 1:
+        # graphd dropped some: ask again in halves.
+        pending += [chunk[:len(chunk) // 2], chunk[len(chunk) // 2:]]
+      else:
+        rows += result
+    return rows
+
+
+class PathGiveUp(Exception):
+  pass
+
+
 class Graph(object):
   """MQL reads against one graphd, one at a time."""
 
   def __init__(self, addr):
     host, port = addr.rsplit(':', 1)
+    self.addr = addr
     self.connector = TracingConnector(addrs=[(host, int(port))])
     self.lock = threading.Lock()
     # One MQLService, kept while graphd is unchanged: it caches schema
@@ -555,6 +631,203 @@ class Graph(object):
         'truncated': len(nodes) > limit or middles == EXPAND_VIA_LIMIT,
     }
 
+  def path(self, a, b, via=None, to=None):
+    """A shortest path from a to b, by one kind of step.
+
+    Without via, a step is a direct link either way (not those in
+    HIDDEN_LINKS, nor links to values). With via and to, a step goes
+    from X through an object M that links to X by via, to an object M
+    links to by to: from an author through a paper to a co-author, with
+    via and to both /dblp/publication/author. Searches from both ends
+    at once, in graphd directly (RawGraphd).
+
+    Returns {"found", "nodes" (from a to b: id, name, types), "steps"
+    (between consecutive nodes: "label"; without via, "property" and
+    "forward", whether the link points along the path; with via,
+    "middles", up to three objects in between, and "shared", how many),
+    "relation" (with via: via, to and their names), "visited",
+    "seconds", "reason" (why not found)}.
+    """
+    if bool(via) != bool(to):
+      raise BadRequest('path with via also needs to, and to needs via')
+    start = time.time()
+    ends = self._guids([a, b])
+    for id in (a, b):
+      if id not in ends:
+        raise NotFound('no object with id %s' % id)
+    ga, gb = ends[a], ends[b]
+    if via:
+      props = self._guids([via, to])
+      for id in (via, to):
+        if id not in props:
+          raise NotFound('no property with id %s' % id)
+      p, q = props[via], props[to]
+      hidden = set()
+    else:
+      p = q = None
+      hidden = set(self._guids(sorted(HIDDEN_LINKS)).values())
+
+    raw = RawGraphd(self.addr, start + PATH_SECONDS)
+    try:
+      # Per side: distance and how each object was reached, {guid:
+      # (previous guid, middle guid or None, typeguid, whether a direct
+      # link points from previous to it)}.
+      sides = [{'dist': {ga: 0}, 'parent': {ga: None}, 'frontier': [ga],
+                'depth': 0, 'forward': True},
+               {'dist': {gb: 0}, 'parent': {gb: None}, 'frontier': [gb],
+                'depth': 0, 'forward': False}]
+      meet, reason = (ga if ga == gb else None), None
+      while meet is None:
+        if not sides[0]['frontier'] or not sides[1]['frontier']:
+          reason = 'not connected'
+          break
+        if sides[0]['depth'] + sides[1]['depth'] >= PATH_MAX_STEPS:
+          reason = 'more than %d steps apart' % PATH_MAX_STEPS
+          break
+        visited = len(sides[0]['dist']) + len(sides[1]['dist'])
+        if visited > PATH_MAX_VISITED:
+          reason = 'gave up after reaching %d objects' % visited
+          break
+        # Grow the side with the smaller frontier, by a whole level.
+        side, other = sorted(sides, key=lambda s: len(s['frontier']))
+        steps = self._path_steps(raw, side['frontier'], p, q, hidden,
+                                 side['forward'])
+        new = []
+        for prev, middle, typeguid, n, out in steps:
+          if n not in side['dist']:
+            side['dist'][n] = side['depth'] + 1
+            side['parent'][n] = (prev, middle, typeguid, out)
+            new.append(n)
+        side['frontier'] = new
+        side['depth'] += 1
+        meets = [n for n in new if n in other['dist']]
+        if meets:
+          meet = min(meets, key=lambda n: other['dist'][n])
+      if meet is not None:
+        nodes, steps = self._path_through(raw, meet, sides, p, q)
+    except PathGiveUp as e:
+      meet, reason = None, str(e)
+    finally:
+      raw.close()
+
+    result = {
+        'found': meet is not None,
+        'visited': len(sides[0]['dist']) + len(sides[1]['dist']),
+        'reason': reason,
+    }
+    if meet is None:
+      result.update(nodes=[], steps=[], relation=None)
+    else:
+      result.update(self._describe_path(nodes, steps, via, to))
+    result['seconds'] = time.time() - start
+    return result
+
+  def _guids(self, ids):
+    """{id: guid without the "#"} for those of ids that exist."""
+    result, _ = self.read([{'id|=': ids, 'id': None, 'guid': None,
+                            'limit': len(ids)}])
+    return {r['id']: r['guid'][1:] for r in result}
+
+  def _path_steps(self, raw, frontier, p, q, hidden, forward):
+    """(from, middle, typeguid, to, out) for every step out of frontier.
+
+    out: for a direct link, whether it points from "from" to "to".
+    """
+    if p is None:
+      out = raw.read_for(frontier, lambda gs: (
+          '(left=%s value=null pagesize=%d result=((left typeguid right)))'
+          % (gs, PATH_PAGESIZE)))
+      into = raw.read_for(frontier, lambda gs: (
+          '(right=%s value=null pagesize=%d result=((right typeguid left)))'
+          % (gs, PATH_PAGESIZE)))
+      return ([(x, None, t, y, True) for x, t, y in out
+               if y and t not in hidden] +
+              [(x, None, t, y, False) for x, t, y in into
+               if y and t not in hidden])
+    # Forward, X <-p- M -q-> Y; the side searching back from b goes the
+    # other way, Y <-q- M -p-> X.
+    first, second = (p, q) if forward else (q, p)
+    starts = raw.read_for(frontier, lambda gs: (
+        '(typeguid=%s right=%s pagesize=%d result=((left right)))'
+        % (first, gs, PATH_PAGESIZE)))
+    via_middle = {}
+    for m, x in starts:
+      via_middle.setdefault(m, x)
+    ends = raw.read_for(sorted(via_middle), lambda gs: (
+        '(typeguid=%s left=%s pagesize=%d result=((left right)))'
+        % (second, gs, PATH_PAGESIZE)))
+    return [(via_middle[m], m, second, y, None) for m, y in ends if y]
+
+  def _path_through(self, raw, meet, sides, p, q):
+    """The guids from a to b through meet, and the steps between."""
+    a_side, b_side = sides
+    nodes, steps = [meet], []
+    n = meet
+    while a_side['parent'][n]:
+      prev, middle, typeguid, out = a_side['parent'][n]
+      nodes.insert(0, prev)
+      steps.insert(0, (middle, typeguid, out))
+      n = prev
+    n = meet
+    while b_side['parent'][n]:
+      # Found searching back from b: the link runs the other way.
+      prev, middle, typeguid, out = b_side['parent'][n]
+      nodes.append(prev)
+      steps.append((middle, typeguid, None if out is None else not out))
+      n = prev
+    if p is None:
+      return nodes, [{'middles': [], 'shared': None, 'typeguid': t,
+                      'forward': out} for _, t, out in steps]
+    # Every object in between each pair, not just the one found.
+    described = []
+    for x, y in zip(nodes, nodes[1:]):
+      from_x = {m for m, in raw.read(
+          '(typeguid=%s right=%s pagesize=%d result=((left)))'
+          % (p, x, PATH_PAGESIZE))}
+      to_y = {m for m, in raw.read(
+          '(typeguid=%s right=%s pagesize=%d result=((left)))'
+          % (q, y, PATH_PAGESIZE))}
+      shared = sorted(from_x & to_y)
+      described.append({'middles': shared[:3], 'shared': len(shared),
+                        'typeguid': None, 'forward': None})
+    return nodes, described
+
+  def _describe_path(self, nodes, steps, via, to):
+    """Ids, names and types for a path's guids."""
+    guids = set(nodes)
+    for st in steps:
+      guids.update(st['middles'])
+      if st['typeguid']:
+        guids.add(st['typeguid'])
+    found, _ = self.read([{
+        'guid|=': ['#' + g for g in sorted(guids)],
+        'guid': None, 'id': None, 'name': None, 'type': [],
+        'limit': len(guids),
+    }])
+    by_guid = {r['guid'][1:]: {'id': r['id'], 'name': r['name'],
+                               'types': r['type']} for r in found}
+    relation = None
+    if via:
+      names = self.properties({via, to})
+      relation = {
+          'via': via, 'to': to,
+          'via_name': names[via]['name'] if via in names else via,
+          'to_name': names[to]['name'] if to in names else to,
+      }
+      label = '%s of, then %s' % (relation['via_name'], relation['to_name'])
+    return {
+        'relation': relation,
+        'nodes': [by_guid[g] for g in nodes],
+        'steps': [{
+            'label': (by_guid[st['typeguid']]['name'] or
+                      by_guid[st['typeguid']]['id']) if not via else label,
+            'property': None if via else by_guid[st['typeguid']]['id'],
+            'forward': st['forward'],
+            'middles': [by_guid[m] for m in st['middles']],
+            'shared': st['shared'],
+        } for st in steps],
+    }
+
   def search(self, text):
     words = text.split()
     if not words:
@@ -646,6 +919,11 @@ def expand(params):
                             max(1, min(limit, EXPAND_NODE_LIMIT)))
 
 
+def path(params):
+  return get_graph().path(required(params, 'a'), required(params, 'b'),
+                          params.get('via') or None, params.get('to') or None)
+
+
 ROUTES = {
     '/api/mqlread': mqlread,
     '/api/topic': topic,
@@ -653,6 +931,7 @@ ROUTES = {
     '/api/search': search,
     '/api/relations': relations,
     '/api/expand': expand,
+    '/api/path': path,
 }
 
 STATUS_TEXT = {

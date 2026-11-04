@@ -29,6 +29,14 @@ the objects that link to it.
     a prefix
   - `GET /api/relations?id=ID` and `GET /api/expand?id=ID[&via=P&to=Q]`:
     an object's neighbours, for the graph view
+  - `GET /api/path?a=ID&b=ID[&via=P&to=Q]`: a shortest path from a to b,
+    by direct links or by one relation (with `via` and `to`, as for
+    expand: through papers to co-authors), with the objects in between
+    each step and how many there are. It searches from both ends at
+    once with flat graphd reads of guids rather than MQL, which would
+    spend most of its time building nested results; two authors are
+    typically found in under a second in all of dblp. It gives up past
+    10 steps, 2 million objects or 60 seconds.
 
   Each gunicorn worker keeps one pymql `MQLService`, whose caches of
   schema (types and properties) and namespaces (ids) save dozens of
@@ -100,6 +108,11 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
     ("Author of, then Author"), or the proceedings their papers are in
     ("Author of, then Part of"); a proceedings' authors ("Part of, then
     Author"); a paper's co-cited papers ("Cites of, then Cites").
+
+  "Find a path" in the side panel adds a shortest path from the selected
+  node to another by the selected relation, through the objects in
+  between (the papers linking a chain of co-authors), highlights it,
+  and lists it with how many such objects each step has.
 
   Double-clicking uses a co-relation like co-authors where there is one.
 

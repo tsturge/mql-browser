@@ -4,8 +4,11 @@
 // its neighbours by one of its relations (/api/relations): its direct
 // links, or objects reached through the objects linking to it, such as
 // an author's co-authors (Author of, then Author), weighted by the
-// number of objects in between. Uses el(), api(), render() and
-// viewHref() from app.js, and vis-network, loaded on first use.
+// number of objects in between. "Find a path" adds a shortest path from
+// the selected node to another (/api/path), by the selected relation:
+// through the objects in between, such as the papers linking a chain of
+// co-authors. Uses el(), api(), render() and viewHref() from app.js,
+// and vis-network, loaded on first use.
 'use strict';
 
 const VIS_SRC = '/vendor/vis-network.min.js';
@@ -65,6 +68,16 @@ async function showGraph(startId) {
                                 placeholder: 'Add a node: name or id'});
   const panel = el('aside', {class: 'graph-panel'});
   const legend = el('div', {class: 'graph-legend'});
+  const pathInput = el('input', {type: 'search', class: 'graph-add graph-path-input',
+                                 placeholder: 'To: name or id'});
+  const pathResult = el('div', {class: 'graph-path-result'});
+  const pathBox = el('div', {class: 'graph-path'},
+    el('h4', {}, 'Find a path'),
+    el('form', {class: 'graph-form', onsubmit: e => { e.preventDefault(); findPath(); }},
+      pathInput, el('button', {type: 'submit'}, 'Find')),
+    el('p', {class: 'note'}, 'A shortest path from this node, by the relation selected above.'),
+    pathResult);
+  let pathEdges = [];
   const button = (label, onclick, title) => el('button', {onclick, title, class: 'secondary'}, label);
 
   render(
@@ -130,6 +143,7 @@ async function showGraph(startId) {
     if (type && !typeNames.has(type)) typeNames.set(type, type);
   }
 
+  // Adds or updates an edge; returns its id.
   function addEdge(e) {
     const id = [e.from, e.to].sort().join('|') + '|' + e.labels.join(',') + (e.directed ? '>' : '');
     const old = edges.get(id);
@@ -140,6 +154,7 @@ async function showGraph(startId) {
       title: `${e.labels.join(', ')}${weight > 1 ? `: ${weight}` : ''}`,
       arrows: e.directed ? {to: {enabled: true, scaleFactor: 0.5}} : undefined,
     });
+    return id;
   }
 
   function refreshNodeSizes() {
@@ -247,23 +262,29 @@ async function showGraph(startId) {
   function clear() {
     nodes.clear();
     edges.clear();
+    pathEdges = [];
+    pathResult.replaceChildren();
     expanded.clear();
     select(null);
     refreshNodeSizes();
   }
 
+  // The id for what's typed in an input: an id, or the best name match.
+  async function resolve(text) {
+    if (text.startsWith('/') || text.startsWith('#')) return text;
+    const {result} = await api('/api/search', {q: text});
+    if (!result.length) {
+      status.textContent = `No match for "${text}"`;
+      return null;
+    }
+    return result[0].id;
+  }
+
   async function addByText() {
     const text = addInput.value.trim();
     if (!text) return;
-    let id = text;
-    if (!text.startsWith('/') && !text.startsWith('#')) {
-      const {result} = await api('/api/search', {q: text});
-      if (!result.length) {
-        status.textContent = `No match for "${text}"`;
-        return;
-      }
-      id = result[0].id;
-    }
+    const id = await resolve(text);
+    if (!id) return;
     addInput.value = '';
     await expand(id);
     select(id);
@@ -287,6 +308,7 @@ async function showGraph(startId) {
       el('div', {class: 'mono note graph-id'}, id),
       el('p', {}, el('a', {href: viewHref(id)}, 'Open page')),
       el('p', {class: 'note'}, 'Loading relations…'),
+      pathBox,
       legend);
     try {
       const rels = await relations(id);
@@ -303,6 +325,77 @@ async function showGraph(startId) {
     } catch (e) {
       panel.children[3].textContent = e.message;
     }
+  }
+
+  async function findPath() {
+    const from = selected;
+    const text = pathInput.value.trim();
+    if (!from || !text) return;
+    const to = await resolve(text);
+    if (!to) return;
+    const [via, then] = JSON.parse(relSelect.value || '[null, null]');
+    const params = {a: from, b: to};
+    if (via) Object.assign(params, {via, to: then});
+    pathResult.replaceChildren(el('p', {class: 'note'}, 'Searching…'));
+    status.textContent = 'Searching for a path…';
+    let r;
+    try {
+      r = await api('/api/path', params);
+    } catch (e) {
+      pathResult.replaceChildren(el('p', {class: 'error'}, e.message));
+      status.textContent = '';
+      return;
+    }
+    const searched = `${r.visited.toLocaleString()} objects searched in ${r.seconds.toFixed(1)} s`;
+    if (!r.found) {
+      pathResult.replaceChildren(el('p', {}, `No path: ${r.reason}.`),
+                                 el('p', {class: 'note'}, searched));
+      refreshNodeSizes();
+      return;
+    }
+    // Un-highlight the last path; draw this one.
+    edges.update(pathEdges.filter(id => edges.get(id)).map(id => ({id, color: null})));
+    pathEdges = [];
+    const ids = [];
+    r.nodes.forEach((n, i) => {
+      addNode(n);
+      ids.push(n.id);
+      const step = r.steps[i];
+      if (!step) return;
+      const next = r.nodes[i + 1];
+      if (step.middles.length) {
+        // x <-via- middle -to-> next, as direct links would show it.
+        const m = step.middles[0];
+        addNode(m);
+        ids.push(m.id);
+        pathEdges.push(
+          addEdge({from: m.id, to: n.id, labels: [r.relation.via_name], weight: 1, directed: true}),
+          addEdge({from: m.id, to: next.id, labels: [r.relation.to_name], weight: 1, directed: true}));
+      } else {
+        pathEdges.push(addEdge({from: step.forward ? n.id : next.id, to: step.forward ? next.id : n.id,
+                                labels: [step.label], weight: 1, directed: true}));
+      }
+    });
+    const accent = cssVar('--accent');
+    edges.update(pathEdges.map(id => ({id, color: {color: accent, highlight: accent, opacity: 1}})));
+    refreshNodeSizes();
+    // Selected, the path's nodes and edges are drawn bold.
+    network.setSelection({nodes: ids, edges: pathEdges}, {highlightEdges: false});
+    network.fit({nodes: ids, animation: true});
+    const steps = r.steps.length;
+    pathResult.replaceChildren(
+      el('p', {}, `${steps} step${steps === 1 ? '' : 's'}. `, el('span', {class: 'note'}, searched)),
+      el('ol', {class: 'graph-path-list'}, r.nodes.map((n, i) => {
+        const step = r.steps[i];
+        return el('li', {},
+          el('a', {href: viewHref(n.id)}, n.name || n.id),
+          step && el('div', {class: 'note'},
+            step.middles.length
+              ? [`${step.shared} shared: `, step.middles.map((m, j) => [j ? ', ' : '',
+                  el('a', {href: viewHref(m.id)}, m.name || m.id)]),
+                 step.shared > step.middles.length ? ', …' : '']
+              : `${step.forward ? '' : '← '}${step.label}${step.forward ? ' →' : ''}`));
+      })));
   }
 
   function renderLegend() {
