@@ -1,8 +1,9 @@
 """A WSGI web service around MQL, for the MQL browser.
 
-  GET /api/mqlread?query=JSON[&cursor=C][&explain=1]
+  GET /api/mqlread?query=JSON[&cursor=C][&explain=1][&asof=T]
                                            run an MQL read
-  GET /api/topic?id=ID                     everything about one object
+  GET /api/topic?id=ID[&asof=T]            everything about one object
+  GET /api/history?id=ID                   changes to an object's links
   GET /api/search?q=TEXT                   objects whose names match
   GET /api/relations?id=ID                 ways to expand ID in a graph
   GET /api/expand?id=ID[&via=P&to=Q]       ID's neighbours in a graph
@@ -10,6 +11,8 @@
 Replies are JSON. mqlread follows Freebase's API: {"code":
 "/api/status/ok", "result": ..., "cursor": ...}, or on error {"code":
 "/api/status/error", "messages": [...]} with HTTP status 400.
+asof=T reads the graph as it was at timestamp T (UTC, like
+2026-11-04T18:28:44; graphd keeps every version of everything).
 With explain=1, the reply (an error too) also has "explain": the
 graphd requests the read made, with their costs; see Trace.
 
@@ -43,6 +46,9 @@ INSTANCE_LIMIT = 100
 EXPAND_VIA_LIMIT = 1000
 EXPAND_NODE_LIMIT = 200
 
+# Most changes to an object's links shown, in each direction.
+HISTORY_LIMIT = 500
+
 # Links shown elsewhere on the page, or not interesting.
 HIDDEN_LINKS = {
     '/type/object/type',
@@ -73,7 +79,8 @@ class Trace(object):
   """The graphd requests one MQL read makes, for explain=1.
 
   cache says whether the read used the cached schema and ids ("kept"),
-  or started afresh ("new", or "flushed" because graphd had changed).
+  or started afresh ("new", or "flushed" because graphd had changed), or
+  did not use the cache ("bypassed": reads of the past never do).
   Each request is {"kind", "query", "ms", "cost", "error"}: kind says
   what it was for ("query" is the read itself; "schema" loads types and
   properties; "id lookup" resolves ids and namespace keys; "dateline"
@@ -184,9 +191,14 @@ class Graph(object):
       trace.cache = 'kept'
     return self.service
 
-  def read(self, query, cursor=None, trace=None):
-    """Runs an MQL read; with a Trace, records its graphd requests."""
+  def read(self, query, cursor=None, trace=None, asof=None):
+    """Runs an MQL read; with a Trace, records its graphd requests.
+
+    With asof, a timestamp, reads the graph as it was then.
+    """
     env = {'escape': False}
+    if asof:
+      env['as_of_time'] = asof
     if cursor is not None:
       # As in Freebase's API, an empty cursor starts paging; pymql wants
       # True for that.
@@ -194,7 +206,15 @@ class Graph(object):
     with self.lock:
       self.connector.trace = trace
       try:
-        r = self.mql_service(trace).read(query, **env)
+        if asof:
+          # Not the cached service: the past's namespaces and schema
+          # would be cached in it, and seen by reads of the present.
+          service = MQLService(connector=self.connector)
+          if trace:
+            trace.cache = 'bypassed'
+        else:
+          service = self.mql_service(trace)
+        r = service.read(query, **env)
       except error.MQLError:
         raise
       except Exception:
@@ -207,9 +227,13 @@ class Graph(object):
           trace.finish()
     return r.result, r.cursor
 
-  def topic(self, id):
-    """The object, its types, and its links grouped by property."""
-    obj, _ = self.read({
+  def topic(self, id, asof=None):
+    """The object, its types, and its links grouped by property.
+
+    With asof, a timestamp, as they were then.
+    """
+    read = lambda q: self.read(q, asof=asof)
+    obj, _ = read({
         'id': id,
         'guid': None,
         'name': None,
@@ -222,7 +246,7 @@ class Graph(object):
 
     def reflect(prop, clause):
       clause = dict(clause, link=None, limit=LINK_LIMIT, optional=True)
-      result, _ = self.read({'id': id, prop: [clause]})
+      result, _ = read({'id': id, prop: [clause]})
       links = [l for l in result[prop] if l['link'] not in HIDDEN_LINKS]
       return links, len(result[prop]) == LINK_LIMIT
 
@@ -233,7 +257,8 @@ class Graph(object):
     values, more_values = reflect('/type/reflect/any_value',
                                   {'value': None, 'type': None})
 
-    props = self.properties({l['link'] for l in outgoing + incoming + values})
+    props = self.properties({l['link'] for l in outgoing + incoming + values},
+                            asof)
     type_order = [t['id'] for t in obj['type']]
 
     def group(links, make_value):
@@ -263,6 +288,7 @@ class Graph(object):
     value = lambda l: {'value': l['value'], 'type': l['type']}
     topic = {
         'id': obj['id'],
+        'asof': asof,
         'guid': obj['guid'],
         'name': obj['name'],
         'timestamp': obj['timestamp'],
@@ -278,10 +304,94 @@ class Graph(object):
         },
     }
     if '/type/type' in type_order:
-      topic['type_info'] = self.type_info(id)
+      topic['type_info'] = self.type_info(id, asof)
     return topic
 
-  def properties(self, ids):
+  def history(self, id, limit=HISTORY_LIMIT):
+    """Every change to the links from and to an object, newest first.
+
+    graphd never overwrites anything: a change writes a new version of
+    a link, and a deletion a version that is no longer live. MQL's
+    /type/link "operation" and "valid" reach those versions. Each change
+    is {"timestamp", "operation" ("insert", "update" or "delete"),
+    "valid" (whether it is still current), "direction" ("out" for the
+    object's own properties, "in" for links to it), "property", "object"
+    (the object at the other end, if any), "value" (a literal value or
+    a key, if any), "creator", "previous" (for an update, the object
+    and value it replaced, when that is shown too)}. The object's
+    creation is the last change, with operation "create".
+    """
+    obj, _ = self.read({'id': id, 'name': None, 'timestamp': None,
+                        'creator': None})
+    if obj is None:
+      raise NotFound('no object with id %s' % id)
+    clause = {
+        'type': '/type/link',
+        'operation': None,
+        'valid': None,
+        'timestamp': None,
+        'creator': None,
+        'master_property': {'id': None, 'name': None, 'unique': None},
+        'target_value': None,
+        'sort': '-timestamp',
+        'limit': limit,
+    }
+    end = {'id': None, 'name': None}
+    outgoing, _ = self.read([dict(clause, source={'id': id},
+                                  target=dict(end, optional=True))])
+    incoming, _ = self.read([dict(clause, target={'id': id}, source=end)])
+
+    def change(l, direction, other):
+      # Text values are links to their language: show just the text.
+      if other and l['target_value'] is not None and (
+          other['id'] or '').startswith('/lang/'):
+        other = None
+      return {
+          'timestamp': l['timestamp'],
+          'operation': l['operation'],
+          'valid': l['valid'],
+          'direction': direction,
+          'property': l['master_property'],
+          'object': other,
+          'value': l['target_value'],
+          'creator': l['creator'],
+          'previous': None,
+      }
+
+    changes = ([change(l, 'out', l['target']) for l in outgoing] +
+               [change(l, 'in', l['source']) for l in incoming])
+    changes.sort(key=lambda c: c['timestamp'])
+    # An update replaces the property's last value (updates are only
+    # made to unique properties).
+    last = {}
+    for c in changes:
+      key = (c['direction'], c['property']['id'])
+      if c['operation'] == 'update' and key in last:
+        c['previous'] = last[key]
+      if c['operation'] == 'delete':
+        last.pop(key, None)
+      else:
+        last[key] = {'object': c['object'], 'value': c['value']}
+    changes.reverse()
+    changes.append({
+        'timestamp': obj['timestamp'],
+        'operation': 'create',
+        'valid': True,
+        'direction': None,
+        'property': None,
+        'object': None,
+        'value': None,
+        'creator': obj['creator'],
+        'previous': None,
+    })
+    return {
+        'id': obj['id'],
+        'name': obj['name'],
+        'changes': changes,
+        'truncated': len(outgoing) == limit or len(incoming) == limit,
+    }
+
+  def properties(self, ids, asof=None):
     """Schema information for property ids, by id."""
     if not ids:
       return {}
@@ -294,12 +404,13 @@ class Graph(object):
         'expected_type': None,
         'schema': {'id': None, 'name': None, 'optional': True},
         'limit': len(ids),
-    }])
+    }], asof=asof)
     return {p['id']: p for p in result}
 
-  def type_info(self, id):
+  def type_info(self, id, asof=None):
     """A type's properties and some of its instances."""
-    props, _ = self.read([{
+    read = lambda q: self.read(q, asof=asof)
+    props, _ = read([{
         'type': '/type/property',
         'schema': {'id': id},
         'id': None,
@@ -309,13 +420,13 @@ class Graph(object):
         'sort': 'name',
         'limit': 1000,
     }])
-    instances, _ = self.read([{
+    instances, _ = read([{
         'type': id,
         'id': None,
         'name': None,
         'limit': INSTANCE_LIMIT,
     }])
-    count, _ = self.read({'type': id, 'return': 'estimate-count'})
+    count, _ = read({'type': id, 'return': 'estimate-count'})
     return {
         'properties': props,
         'instances': instances,
@@ -493,7 +604,8 @@ def mqlread(params):
     raise BadRequest('query is not valid JSON: %s' % e)
   trace = Trace() if params.get('explain') in ('1', 'true') else None
   try:
-    result, cursor = get_graph().read(query, params.get('cursor'), trace)
+    result, cursor = get_graph().read(query, params.get('cursor'), trace,
+                                      params.get('asof') or None)
   except error.MQLError as e:
     if trace:
       raise ExplainedError(e, trace)
@@ -509,7 +621,11 @@ def mqlread(params):
 
 
 def topic(params):
-  return get_graph().topic(required(params, 'id'))
+  return get_graph().topic(required(params, 'id'), params.get('asof') or None)
+
+
+def history(params):
+  return get_graph().history(required(params, 'id'))
 
 
 def search(params):
@@ -533,6 +649,7 @@ def expand(params):
 ROUTES = {
     '/api/mqlread': mqlread,
     '/api/topic': topic,
+    '/api/history': history,
     '/api/search': search,
     '/api/relations': relations,
     '/api/expand': expand,

@@ -258,3 +258,43 @@ div.vis-tooltip {
 .gq .gq-text { margin: 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .gq .gq-costs, .gq .error { margin: 8px 12px 12px; }
 .gq-text a.guid { color: var(--accent); }
+
+/* history and as-of views */
+.asof-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+.asof-input {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+}
+.asof-form button { padding: 4px 12px; font-size: 13px; }
+.asof-banner {
+  margin: 0 0 16px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--chip);
+}
+table.history tr:first-child td { border-top: 0; }
+table.history td:first-child { white-space: nowrap; color: var(--muted); width: 1%; }
+table.history td:nth-child(2), table.history td:last-child { white-space: nowrap; width: 1%; }
+table.history tr.superseded td:nth-child(3), table.history tr.superseded td:nth-child(4) { opacity: .55; }
+table.history del { color: var(--muted); }
+.op {
+  display: inline-block;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.op-insert { background: #dcfce7; color: #166534; }
+.op-update { background: #fef3c7; color: #92400e; }
+.op-delete { background: #fee2e2; color: #991b1b; }
+.op-create { background: var(--chip); color: var(--accent); }
+@media (prefers-color-scheme: dark) {
+  .op-insert { background: #14361f; color: #86efac; }
+  .op-update { background: #3a2a0b; color: #fcd34d; }
+  .op-delete { background: #3d1515; color: #fca5a5; }
+}

@@ -7,7 +7,8 @@ the objects that link to it.
 - `server.py` is the web service, a WSGI application run by gunicorn. It
   runs MQL reads through pymql against the graphd named by `GRAPHD_ADDR`
   and answers:
-  - `GET /api/mqlread?query=JSON[&cursor=C][&explain=1]`: an MQL read,
+  - `GET /api/mqlread?query=JSON[&cursor=C][&explain=1][&asof=T]`: an
+    MQL read,
     with Freebase's reply format (`{"code": "/api/status/ok", "result":
     ...}`). An empty `cursor` starts paging. With `explain=1` the reply,
     an error's too, has an `explain` listing the graphd requests the read
@@ -15,8 +16,15 @@ the objects that link to it.
     lookup`; or `dateline`, the check described below), its graphd
     query text, its time and graphd's cost for it
     (see "cost" in graphd's `doc/gr-protocol.txt`), and whether the
-    server's cache was used.
-  - `GET /api/topic?id=ID`: everything the browser shows for an object
+    server's cache was used. With `asof`, a UTC timestamp like
+    `2026-11-04T18:28:44`, it reads the graph as it was then: graphd
+    keeps every version of every primitive.
+  - `GET /api/topic?id=ID[&asof=T]`: everything the browser shows for an
+    object, now or as it was at T
+  - `GET /api/history?id=ID`: every change to the links from and to an
+    object, newest first (the most recent 500 each way): what was added,
+    changed (with the value it replaced) or removed, when and by whom,
+    from MQL's link history (`/type/link`'s `operation` and `valid`)
   - `GET /api/search?q=TEXT`: objects whose names match, the last word as
     a prefix
   - `GET /api/relations?id=ID` and `GET /api/expand?id=ID[&via=P&to=Q]`:
@@ -28,6 +36,8 @@ the objects that link to it.
   200. Before each read the server asks graphd for its dateline, which
   every write advances; if it has moved, the server starts a new
   service with empty caches, so reads never see stale schema or ids.
+  Reads of the past (`asof`) use a service of their own, so that what
+  they see is never cached for reads of the present.
 - `static/` is the browser, a single page using those APIs.
 - nginx serves `static/` and passes `/api/` to gunicorn over a Unix
   socket (`nginx.conf.in`). It also serves the MQL manual, from the
@@ -67,11 +77,14 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
 ## Pages
 
 - `#/view/ID`: an object. A type's page also lists its properties and
-  some of its instances.
+  some of its instances. "View as of" shows it as it was at a time;
+  `#/view/ID?asof=T` stays in the past as you follow links.
+- `#/history/ID`: changes to an object's links, by day, each with a link
+  to the object just after it.
 - `#/search/TEXT`: name search. Entering an id (`/en/...` or a `#guid`)
   in the search box goes straight to the object.
 - `#/query`: an MQL query editor; ids in the results link to their pages.
-  With Explain checked, the results are followed by the graphd requests
+  "As of" runs the query against the past. With Explain checked, the results are followed by the graphd requests
   behind them, one constraint per line, with their costs; guids in them
   link to their objects.
 - `#/graph/ID`: a graph of objects and the links between them, drawn

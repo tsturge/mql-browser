@@ -1,6 +1,9 @@
 // MQL Browser: a single page over /api/topic, /api/search and
 // /api/mqlread. Routes live in the URL hash:
 //   #/view/<id>     an object
+//   #/view/<id>?asof=<timestamp>
+//                   an object as it was at a time (UTC)
+//   #/history/<id>  changes to an object's links
 //   #/search/<text> name search
 //   #/query         MQL query editor
 //   #/graph/<id>    graph view (graph.js)
@@ -30,7 +33,22 @@ function render(...children) {
     c => c !== null && c !== undefined && c !== false));
 }
 
-function viewHref(id) { return '#/view/' + encodeURIComponent(id); }
+// While viewing the past (#/view/...?asof=T), links stay in it.
+let currentAsof = null;
+
+function viewHref(id, asof = currentAsof) {
+  return '#/view/' + encodeURIComponent(id)
+    + (asof ? '?asof=' + encodeURIComponent(asof) : '');
+}
+function historyHref(id) { return '#/history/' + encodeURIComponent(id); }
+
+// graphd timestamps, like 2026-11-04T18:28:44.0012Z: the digits after
+// the seconds number the primitives written in that second.
+function formatTime(ts) {
+  return ts ? ts.replace('T', ' ').replace(/\.\d+Z?$|Z$/, '') : '';
+}
+// The present, as a timestamp for a datetime-local input (UTC).
+function nowUtc() { return new Date().toISOString().slice(0, 19); }
 
 function objectLink(obj) {
   return el('a', {href: viewHref(obj.id), title: obj.id}, obj.name || obj.id);
@@ -49,6 +67,7 @@ async function api(path, params) {
     const msgs = (body.messages || []).map(m => m.message).join('\n');
     const err = new Error(msgs || `${resp.status} ${resp.statusText}`);
     err.body = body;
+    err.status = resp.status;
     throw err;
   }
   return body;
@@ -109,18 +128,46 @@ function renderTypeInfo(info, typeId) {
   ];
 }
 
-async function showTopic(id) {
+function asofForm(id, asof) {
+  const input = el('input', {type: 'datetime-local', step: '1', class: 'asof-input',
+                             value: (asof || nowUtc()).slice(0, 19)});
+  return el('form', {class: 'asof-form', onsubmit: e => {
+    e.preventDefault();
+    if (input.value) location.hash = viewHref(id, input.value);
+  }}, el('label', {}, 'View as of ', input, ' UTC '),
+     el('button', {class: 'secondary'}, 'Go'));
+}
+
+async function showTopic(id, asof) {
   loading();
-  const t = await api('/api/topic', {id});
-  document.title = (t.name || t.id) + ' – MQL Browser';
+  let t;
+  try {
+    t = await api('/api/topic', asof ? {id, asof} : {id});
+  } catch (e) {
+    if (!(asof && e.status === 404)) throw e;
+    render(
+      el('div', {class: 'asof-banner'}, `${id} did not exist at ${formatTime(asof)} UTC. `,
+        el('a', {href: viewHref(id, null)}, 'View it now'), ' · ',
+        el('a', {href: historyHref(id)}, 'History')),
+      asofForm(id, asof));
+    return;
+  }
+  document.title = (t.name || t.id) + (asof ? ` (${formatTime(asof)})` : '')
+    + ' – MQL Browser';
   const truncated = Object.entries(t.truncated).filter(([, v]) => v).map(([k]) => k);
   render(
+    asof && el('div', {class: 'asof-banner'},
+      `As it was at ${formatTime(asof)} UTC. `,
+      el('a', {href: viewHref(t.id, null)}, 'View it now'), ' · ',
+      el('a', {href: historyHref(t.id)}, 'History')),
     el('h1', {}, t.name || t.id),
     el('div', {class: 'ids mono'},
       el('span', {}, t.id),
       el('span', {}, t.guid),
-      t.timestamp && el('span', {}, t.timestamp),
-      el('a', {href: graphHref(t.id)}, 'Graph')),
+      t.timestamp && el('span', {title: 'created'}, t.timestamp),
+      el('a', {href: graphHref(t.id)}, 'Graph'),
+      el('a', {href: historyHref(t.id)}, 'History')),
+    asofForm(t.id, asof),
     el('div', {class: 'chips'}, t.types.map(ty =>
       el('a', {class: 'chip', href: viewHref(ty.id), title: ty.id}, ty.name || ty.id))),
     t.keys.length > 1 && el('p', {class: 'note'}, 'Keys: ',
@@ -135,6 +182,71 @@ async function showTopic(id) {
     t.incoming.length ? renderSections(t.incoming, true)
                       : el('p', {class: 'note'}, 'Nothing links here.'),
   );
+}
+
+// ---- history ----
+
+const OPERATIONS = {
+  create: 'created',
+  insert: 'added',
+  update: 'changed',
+  delete: 'removed',
+};
+
+function renderEnd(object, value) {
+  if (object && value !== null) return [objectLink(object), el('span', {class: 'value-type'}, value)];
+  if (object) return objectLink(object);
+  return el('span', {class: 's'}, JSON.stringify(value));
+}
+
+function renderChange(c, id) {
+  const property = c.property && (c.direction === 'in'
+    ? [el('a', {href: viewHref(c.property.id), title: c.property.id}, c.property.name || c.property.id), ' of']
+    : el('a', {href: viewHref(c.property.id), title: c.property.id}, c.property.name || c.property.id));
+  const value = c.operation === 'create' ? null
+    : c.previous ? [el('del', {}, renderEnd(c.previous.object, c.previous.value)), ' → ',
+                    renderEnd(c.object, c.value)]
+    : renderEnd(c.object, c.value);
+  // An insertion or update that a later change replaced or removed.
+  const superseded = !c.valid && c.operation !== 'delete';
+  return el('tr', {class: superseded ? 'superseded' : null,
+                   title: superseded ? 'No longer current' : null},
+    el('td', {class: 'mono'}, formatTime(c.timestamp).slice(11)),
+    el('td', {}, el('span', {class: 'op op-' + c.operation}, OPERATIONS[c.operation])),
+    el('td', {}, property),
+    el('td', {}, value),
+    el('td', {}, c.creator ? objectLink({id: c.creator, name: c.creator.replace(/^\/user\//, '')}) : ''),
+    el('td', {}, el('a', {href: viewHref(id, c.timestamp), title: 'The object just after this change'},
+      'as of')));
+}
+
+async function showHistory(id) {
+  loading();
+  const h = await api('/api/history', {id});
+  document.title = `History of ${h.name || h.id} – MQL Browser`;
+  // Newest first, under a heading for each day.
+  const days = [];
+  for (const c of h.changes) {
+    const day = formatTime(c.timestamp).slice(0, 10);
+    if (!days.length || days[days.length - 1].day !== day) days.push({day, changes: []});
+    days[days.length - 1].changes.push(c);
+  }
+  render(
+    el('h1', {}, 'History: ', el('a', {href: viewHref(h.id)}, h.name || h.id)),
+    el('div', {class: 'ids mono'}, el('span', {}, h.id),
+      el('a', {href: graphHref(h.id)}, 'Graph')),
+    el('p', {class: 'note'},
+      `${h.changes.length - 1} changes to links from and to this object since it was created. `
+      + 'Times are UTC; faded rows were later replaced or removed. '
+      + '“As of” shows the object just after a change.'),
+    asofForm(h.id, null),
+    h.truncated && el('p', {class: 'more'},
+      'Only the most recent changes in each direction are shown.'),
+    days.map(d => [
+      el('h2', {}, d.day),
+      el('div', {class: 'section'}, el('div', {class: 'table-wrap'},
+        el('table', {class: 'history'}, d.changes.map(c => renderChange(c, h.id))))),
+    ]));
 }
 
 // ---- search ----
@@ -215,6 +327,7 @@ const KINDS = {
 
 const CACHE_NOTES = {
   kept: 'Schema and ids came from the server\'s cache.',
+  bypassed: 'Reads of the past don\'t use the server\'s cache of schema and ids.',
   new: 'The server\'s cache of schema and ids was empty.',
   flushed: 'graphd had changed, so the server dropped its cache of schema and ids.',
 };
@@ -318,6 +431,8 @@ function showQuery() {
   pendingQuery = null;
   const out = el('div', {});
   const status = el('span', {class: 'note'});
+  const asof = el('input', {type: 'text', class: 'asof-input mono', size: '22',
+                            placeholder: 'now', title: 'Run the query as of a time (UTC), like 2026-11-04T18:28:44'});
   const explain = el('input', {type: 'checkbox', id: 'explain'});
   explain.checked = explainQueries;
   explain.addEventListener('change', () => { explainQueries = explain.checked; });
@@ -335,6 +450,7 @@ function showQuery() {
     try {
       const params = {query: JSON.stringify(query)};
       if (explain.checked) params.explain = '1';
+      if (asof.value.trim()) params.asof = asof.value.trim();
       const r = await api('/api/mqlread', params);
       status.textContent = `${Math.round(performance.now() - started)} ms`;
       out.replaceChildren(el('pre', {class: 'json'}, renderJson(r.result)),
@@ -358,6 +474,7 @@ function showQuery() {
     el('div', {class: 'toolbar'},
       el('button', {onclick: run}, 'Run'),
       el('label', {class: 'note', for: 'explain'}, explain, ' Explain'),
+      el('label', {class: 'note'}, 'As of ', asof),
       el('span', {class: 'note'}, '⌘/Ctrl + Enter'),
       status),
     out);
@@ -399,12 +516,17 @@ async function showHome() {
 }
 
 async function route() {
-  const hash = location.hash.replace(/^#/, '') || '/';
+  const full = location.hash.replace(/^#/, '') || '/';
+  const q = full.indexOf('?');
+  const hash = q < 0 ? full : full.slice(0, q);
+  const params = new URLSearchParams(q < 0 ? '' : full.slice(q + 1));
   const [, page, ...rest] = hash.split('/');
   const arg = decodeURIComponent(rest.join('/'));
+  currentAsof = page === 'view' ? params.get('asof') : null;
   main.classList.toggle('wide', page === 'graph');
   try {
-    if (page === 'view' && arg) await showTopic(arg);
+    if (page === 'view' && arg) await showTopic(arg, currentAsof);
+    else if (page === 'history' && arg) await showHistory(arg);
     else if (page === 'search' && arg) await showSearch(arg);
     else if (page === 'query') showQuery();
     else if (page === 'graph') await showGraph(arg || null);
@@ -420,7 +542,7 @@ document.getElementById('search-form').addEventListener('submit', e => {
   const q = document.getElementById('search').value.trim();
   if (!q) return;
   location.hash = (q.startsWith('/') || q.startsWith('#'))
-    ? viewHref(q) : '#/search/' + encodeURIComponent(q);
+    ? viewHref(q, null) : '#/search/' + encodeURIComponent(q);
 });
 window.addEventListener('hashchange', route);
 route();

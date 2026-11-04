@@ -447,7 +447,7 @@ class ServerTest(GraphdTestCase):
     # Another client writes: a new object, under a new key in a
     # namespace the server has cached.
     pymql.MQLService(connector=graph.TcpGraphConnector(
-        addrs=[tuple(_addr(self.graphd_addr))])).write({
+        addrs=[_addr(self.graphd_addr)])).write({
             'create': 'unconditional', 'id': None,
             'key': {'namespace': '/en', 'value': 'cache_probe'},
             'name': _text('Cache probe'),
@@ -457,6 +457,79 @@ class ServerTest(GraphdTestCase):
     self.assertEqual(body['result'], {'id': '/en/cache_probe',
                                       'name': 'Cache probe'})
     self.assertEqual(read()['explain']['cache'], 'kept')
+
+  def testHistoryAndAsof(self):
+    probe = '/en/history_probe'
+    writer = pymql.MQLService(connector=graph.TcpGraphConnector(
+        addrs=[_addr(self.graphd_addr)]))
+    for q in [
+        {'create': 'unconditional', 'id': None, 'name': _text('Probe'),
+         'key': {'namespace': '/en', 'value': 'history_probe'}},
+        {'id': probe, 'name': dict(_text('Probe 2'), connect='update')},
+        {'id': probe, 'type': {'id': '/t/singer', 'connect': 'insert'}},
+        {'id': probe, 'type': {'id': '/t/singer', 'connect': 'delete'}},
+    ]:
+      writer.write(q, **ROOT)
+
+    h = self.graph.history(probe)
+    self.assertEqual(h['name'], 'Probe 2')
+    self.assertFalse(h['truncated'])
+    changes = [(c['operation'], c['direction'],
+                c['property'] and c['property']['id'], c['valid'])
+               for c in h['changes']]
+    # Newest first; the creation last.
+    self.assertEqual(changes[:3], [
+        ('delete', 'out', '/type/object/type', False),
+        ('insert', 'out', '/type/object/type', False),
+        ('update', 'out', '/type/object/name', True),
+    ])
+    self.assertEqual(changes[-1], ('create', None, None, True))
+    self.assertIn(('insert', 'in', '/type/namespace/keys', True), changes)
+    self.assertIn(('insert', 'out', '/type/object/name', False), changes)
+    rename = h['changes'][2]
+    self.assertEqual(rename['value'], 'Probe 2')
+    self.assertIsNone(rename['object'])  # Text, not its /lang/en.
+    self.assertEqual(rename['previous'], {'object': None, 'value': 'Probe'})
+    self.assertEqual(rename['creator'], '/user/root')
+    self.assertEqual(h['changes'][1]['object'],
+                     {'id': '/t/singer', 'name': 'Singer'})
+    timestamps = [c['timestamp'] for c in h['changes']]
+    self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+
+    # As of each change: just after it.
+    deleted, inserted, renamed = timestamps[:3]
+    created = timestamps[-1]
+    singer = lambda t: [ty['id'] for ty in t['types']] == ['/t/singer']
+    t = self.graph.topic(probe, asof=inserted)
+    self.assertEqual((t['name'], t['asof']), ('Probe 2', inserted))
+    self.assertTrue(singer(t))
+    self.assertFalse(singer(self.graph.topic(probe, asof=deleted)))
+    self.assertEqual(self.graph.topic(probe, asof=renamed)['name'], 'Probe 2')
+    keyed = [c['timestamp'] for c in h['changes']
+             if c['property'] and c['property']['id'] == '/type/namespace/keys']
+    self.assertEqual(self.graph.topic(probe, asof=keyed[0])['name'], 'Probe')
+    self.assertLess(created, keyed[0])
+    with self.assertRaises(server.NotFound):
+      self.graph.topic(probe, asof='2000-01-01T00:00:00')
+
+    # Through the API; reads of the past don't touch the cache.
+    status, body = self.get_json('/api/history', id=probe)
+    self.assertEqual(status, 200)
+    self.assertLen(body['changes'], len(h['changes']))
+    query = json.dumps({'id': probe, 'name': None, 'type': []})
+    status, body = self.get_json('/api/mqlread', query=query, asof=inserted,
+                                 explain='1')
+    self.assertEqual(status, 200, body)
+    self.assertEqual(body['result']['type'], ['/t/singer'])
+    self.assertEqual(body['explain']['cache'], 'bypassed')
+    status, body = self.get_json('/api/topic', id=probe, asof=renamed)
+    self.assertEqual((status, body['name']), (200, 'Probe 2'))
+    status, body = self.get_json('/api/mqlread', query=query, explain='1')
+    self.assertEqual(body['result']['type'], [])
+    self.assertNotEqual(body['explain']['cache'], 'bypassed')
+    status, body = self.get_json('/api/mqlread', query=query, asof='junk')
+    self.assertEqual(status, 400)
+    self.assertIn('asof', body['messages'][0]['message'])
 
   def testMqlreadWithoutExplain(self):
     for explain in ({}, {'explain': '0'}):
