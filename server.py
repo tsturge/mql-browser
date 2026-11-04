@@ -1,6 +1,7 @@
 """A WSGI web service around MQL, for the MQL browser.
 
-  GET /api/mqlread?query=JSON[&cursor=C]   run an MQL read
+  GET /api/mqlread?query=JSON[&cursor=C][&explain=1]
+                                           run an MQL read
   GET /api/topic?id=ID                     everything about one object
   GET /api/search?q=TEXT                   objects whose names match
   GET /api/relations?id=ID                 ways to expand ID in a graph
@@ -9,6 +10,8 @@
 Replies are JSON. mqlread follows Freebase's API: {"code":
 "/api/status/ok", "result": ..., "cursor": ...}, or on error {"code":
 "/api/status/error", "messages": [...]} with HTTP status 400.
+With explain=1, the reply (an error too) also has "explain": the
+graphd requests the read made, with their costs; see Trace.
 
 It runs under gunicorn behind nginx, which serves the browser (static/);
 see run.sh. GRAPHD_ADDR (host:port) names the graphd:
@@ -19,6 +22,8 @@ see run.sh. GRAPHD_ADDR (host:port) names the graphd:
 import json
 import os
 import threading
+import time
+import traceback
 import urllib.parse
 
 from absl import flags
@@ -26,6 +31,7 @@ from absl import flags
 from pymql import MQLService
 from pymql.mql import error
 from pymql.mql import graph
+from pymql.mql.grparse import coststr_to_dict
 
 # Most links of one kind (outgoing, incoming, values) shown for an object.
 LINK_LIMIT = 500
@@ -54,24 +60,115 @@ class NotFound(Exception):
   pass
 
 
+class ExplainedError(Exception):
+  """An MQL error, with the Trace of the read that raised it."""
+
+  def __init__(self, mql_error, trace):
+    super().__init__(str(mql_error))
+    self.mql_error = mql_error
+    self.trace = trace
+
+
+class Trace(object):
+  """The graphd requests one MQL read makes, for explain=1.
+
+  Each request is {"kind", "query", "ms", "cost", "error"}: kind says
+  what pymql sent it for ("query" is the read itself; "schema" loads
+  types and properties; "id lookup" resolves ids and namespace keys);
+  query is the graphd request; ms the time to its reply; cost graphd's
+  account of the work (see the "cost" reply in graphd's
+  doc/gr-protocol.txt).
+  """
+
+  def __init__(self):
+    self.requests = []
+    self.start = time.time()
+    self.ms = None
+
+  def finish(self):
+    self.ms = (time.time() - self.start) * 1000
+
+  def as_json(self):
+    graphd_ms = sum(r['ms'] for r in self.requests)
+    return {
+        'ms': self.ms,
+        'graphd_ms': graphd_ms,
+        'requests': self.requests,
+    }
+
+
+def request_kind(stack):
+  """What pymql sent a graphd request for, from the stack sending it."""
+  modules = set()
+  for frame in stack:
+    path = frame.filename.replace(os.sep, '/')
+    if '/pymql/' not in path:
+      continue
+    module = path.rsplit('/', 1)[-1]
+    if module == 'hijson.py' and frame.name == 'graph_read':
+      return 'query'
+    modules.add(module)
+  if 'schema.py' in modules:
+    return 'schema'
+  if modules & {'lookup.py', 'namespace.py'}:
+    return 'id lookup'
+  return 'other'
+
+
+class TracingConnector(graph.TcpGraphConnector):
+  """A graphd connection that records requests while trace is set."""
+
+  trace = None
+
+  def transmit_query(self, msg, policy, deadline, **kwargs):
+    trace = self.trace
+    if trace is None:
+      return super().transmit_query(msg, policy, deadline, **kwargs)
+    entry = {
+        'kind': request_kind(traceback.extract_stack()),
+        'query': msg,
+        'cost': None,
+        'error': None,
+    }
+    trace.requests.append(entry)
+    start = time.time()
+    try:
+      result = super().transmit_query(msg, policy, deadline, **kwargs)
+      entry['cost'] = coststr_to_dict(result.cost)
+      return result
+    except error.MQLError as e:
+      entry['error'] = str(e)
+      entry['cost'] = coststr_to_dict(getattr(e, 'cost', None))
+      raise
+    finally:
+      entry['ms'] = (time.time() - start) * 1000
+
+
 class Graph(object):
   """MQL reads against one graphd, one at a time."""
 
   def __init__(self, addr):
     host, port = addr.rsplit(':', 1)
-    self.connector = graph.TcpGraphConnector(addrs=[(host, int(port))])
+    self.connector = TracingConnector(addrs=[(host, int(port))])
     self.lock = threading.Lock()
 
-  def read(self, query, cursor=None):
+  def read(self, query, cursor=None, trace=None):
+    """Runs an MQL read; with a Trace, records its graphd requests."""
     env = {'escape': False}
     if cursor is not None:
       # As in Freebase's API, an empty cursor starts paging; pymql wants
       # True for that.
       env['cursor'] = True if cursor in ('', 'true') else cursor
     with self.lock:
-      # A new service per read: MQLService caches namespace contents and
-      # would not see changes made by other clients.
-      r = MQLService(connector=self.connector).read(query, **env)
+      self.connector.trace = trace
+      try:
+        # A new service per read: MQLService caches namespace contents
+        # and would not see changes made by other clients.
+        r = MQLService(connector=self.connector).read(query, **env)
+      finally:
+        self.connector.trace = None
+        if trace:
+          trace.finish()
     return r.result, r.cursor
 
   def topic(self, id):
@@ -358,12 +455,21 @@ def mqlread(params):
     query = json.loads(required(params, 'query'))
   except ValueError as e:
     raise BadRequest('query is not valid JSON: %s' % e)
-  result, cursor = get_graph().read(query, params.get('cursor'))
-  return {
+  trace = Trace() if params.get('explain') in ('1', 'true') else None
+  try:
+    result, cursor = get_graph().read(query, params.get('cursor'), trace)
+  except error.MQLError as e:
+    if trace:
+      raise ExplainedError(e, trace)
+    raise
+  reply = {
       'code': '/api/status/ok',
       'result': result,
       'cursor': cursor,
   }
+  if trace:
+    reply['explain'] = trace.as_json()
+  return reply
 
 
 def topic(params):
@@ -408,6 +514,13 @@ def error_reply(message):
   return {'code': '/api/status/error', 'messages': [{'message': message}]}
 
 
+def mql_error_reply(e):
+  return {
+      'code': '/api/status/error',
+      'messages': [dict(e.error, message=str(e))],
+  }
+
+
 def application(environ, start_response):
   """The WSGI entry point."""
   path = environ.get('PATH_INFO', '')
@@ -428,10 +541,10 @@ def application(environ, start_response):
   except NotFound as e:
     status, body = 404, error_reply(str(e))
   except error.MQLError as e:
-    status, body = 400, {
-        'code': '/api/status/error',
-        'messages': [dict(e.error, message=str(e))],
-    }
+    status, body = 400, mql_error_reply(e)
+  except ExplainedError as e:
+    status, body = 400, mql_error_reply(e.mql_error)
+    body['explain'] = e.trace.as_json()
   data = json.dumps(body, indent=1, ensure_ascii=False, default=str).encode()
   start_response('%d %s' % (status, STATUS_TEXT[status]), [
       ('Content-Type', 'application/json; charset=utf-8'),

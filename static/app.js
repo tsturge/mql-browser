@@ -47,7 +47,9 @@ async function api(path, params) {
   }
   if (!resp.ok) {
     const msgs = (body.messages || []).map(m => m.message).join('\n');
-    throw new Error(msgs || `${resp.status} ${resp.statusText}`);
+    const err = new Error(msgs || `${resp.status} ${resp.statusText}`);
+    err.body = body;
+    throw err;
   }
   return body;
 }
@@ -154,6 +156,7 @@ async function showSearch(text) {
 // ---- query editor ----
 
 let pendingQuery = null;
+let explainQueries = false;
 const EXAMPLE_QUERY = [{
   type: '/type/type',
   id: null,
@@ -184,6 +187,123 @@ function renderJson(v, indent = '') {
   return [el('span', {class: 'n'}, JSON.stringify(v))];
 }
 
+// ---- explain: the graphd requests behind a read ----
+
+// graphd's cost fields (graphd/doc/gr-protocol.txt), in display order.
+const COSTS = {
+  tr: 'real time in graphd, ms',
+  tu: 'user CPU time in graphd, ms',
+  ts: 'system CPU time in graphd, ms (mostly disk reads)',
+  te: 'end-to-end time in graphd, ms, including waiting',
+  dr: 'primitives read',
+  in: 'index lookups',
+  ir: 'index elements read',
+  va: 'result values allocated',
+  pf: 'page faults',
+  pr: 'page reclaims',
+  dw: 'primitives written',
+  iw: 'index elements written',
+};
+// Request kinds (see server.py's Trace): one, many, what they're for.
+const KINDS = {
+  'query': ['query', 'queries', 'the read itself, compiled to graphd'],
+  'schema': ['schema load', 'schema loads', 'types and properties the query names'],
+  'id lookup': ['id lookup', 'id lookups', 'ids and namespace keys resolved to guids'],
+  'other': ['other request', 'other requests', ''],
+};
+
+function ms(n) { return n < 10 ? n.toFixed(1) + ' ms' : Math.round(n) + ' ms'; }
+function countOf(n, one, many) { return `${n} ${n === 1 ? one : many}`; }
+
+// A graphd request, one constraint per line, with guids linked.
+// "(" after "=" or inside such a list ("result=((guid contents))",
+// "guid=(a b)") is a value list and stays on its line; any other "("
+// opens a constraint.
+function formatGraphd(text) {
+  const tokens = text.match(/"(?:[^"\\]|\\.)*"|[()]|[^\s()"]+|\s+/g) || [];
+  const out = [];
+  const stack = [];
+  let depth = 0;
+  let prev = '';
+  for (const t of tokens) {
+    if (/^\s+$/.test(t)) {
+      if (!/\n$/.test(String(out[out.length - 1] || ''))) out.push(' ');
+      continue;
+    }
+    if (t === '(') {
+      const inline = prev.endsWith('=') || (prev === '(' && stack[stack.length - 1] === false);
+      stack.push(!inline);
+      if (!inline) {
+        if (out.length && out[out.length - 1] === ' ') out.pop();
+        out.push('\n' + '  '.repeat(depth));
+        depth++;
+      }
+      out.push('(');
+    } else if (t === ')') {
+      if (out[out.length - 1] === ' ') out.pop();
+      if (stack.pop()) depth--;
+      out.push(')');
+    } else if (/^[0-9a-f]{32}$/.test(t)) {
+      out.push(el('a', {href: viewHref('#' + t), class: 'guid'}, t));
+    } else if (t.startsWith('"')) {
+      out.push(el('span', {class: 's'}, t));
+    } else {
+      const m = t.match(/^([a-z<>\-]+=)(.*)$/);
+      out.push(m ? [el('span', {class: 'k'}, m[1]), m[2]] : t);
+    }
+    prev = t;
+  }
+  return out;
+}
+
+function costChips(cost, keys) {
+  if (!cost) return null;
+  return el('span', {class: 'costs'}, keys.filter(k => k in cost).map(k =>
+    el('span', {class: 'cost', title: COSTS[k]}, `${k}=${cost[k]}`)));
+}
+
+function renderRequest(r, i, open) {
+  return el('details', {class: 'gq', open: open || null},
+    el('summary', {},
+      el('span', {class: 'gq-n'}, '#' + (i + 1)),
+      el('span', {class: 'gq-kind'}, r.kind),
+      el('span', {}, ms(r.ms)),
+      costChips(r.cost, ['tr', 'dr', 'ir']),
+      r.error ? el('span', {class: 'gq-error'}, 'error') : null),
+    el('pre', {class: 'json gq-text'}, formatGraphd(r.query)),
+    r.error ? el('div', {class: 'error'}, r.error) : null,
+    r.cost ? el('div', {class: 'gq-costs'}, costChips(r.cost, Object.keys(COSTS))) : null);
+}
+
+function renderExplain(x) {
+  const reqs = x.requests.map((r, i) => ({...r, i}));
+  const totals = {};
+  for (const r of reqs) {
+    for (const [k, v] of Object.entries(r.cost || {})) totals[k] = (totals[k] || 0) + v;
+  }
+  const byKind = {};
+  for (const r of reqs) (byKind[r.kind] = byKind[r.kind] || []).push(r);
+  const kinds = Object.keys(KINDS).filter(k => byKind[k]);
+  const count = k => countOf(byKind[k].length, KINDS[k][0], KINDS[k][1]);
+  return el('div', {class: 'explain'},
+    el('h2', {}, 'Explain'),
+    el('p', {},
+      `${countOf(reqs.length, 'graphd request', 'graphd requests')}, `
+      + `${ms(x.graphd_ms)} waiting on graphd of ${ms(x.ms)} in all: `
+      + kinds.map(count).join(', ') + '.'),
+    el('div', {class: 'gq-costs'}, costChips(totals, Object.keys(COSTS))),
+    kinds.map(k => {
+      // The query itself is shown open; the rest folded by kind.
+      const rows = byKind[k].map(r => renderRequest(r, r.i, k === 'query'));
+      if (k === 'query') return rows;
+      const kms = byKind[k].reduce((a, r) => a + r.ms, 0);
+      return el('details', {class: 'gq-group'},
+        el('summary', {}, count(k), ' ',
+          el('span', {class: 'note'}, `${ms(kms)} · ${KINDS[k][2]}`)),
+        rows);
+    }));
+}
+
 function showQuery() {
   document.title = 'Query – MQL Browser';
   const text = el('textarea', {id: 'query-text', spellcheck: 'false'});
@@ -191,6 +311,9 @@ function showQuery() {
   pendingQuery = null;
   const out = el('div', {});
   const status = el('span', {class: 'note'});
+  const explain = el('input', {type: 'checkbox', id: 'explain'});
+  explain.checked = explainQueries;
+  explain.addEventListener('change', () => { explainQueries = explain.checked; });
 
   async function run() {
     let query;
@@ -203,12 +326,16 @@ function showQuery() {
     status.textContent = 'Running…';
     const started = performance.now();
     try {
-      const r = await api('/api/mqlread', {query: JSON.stringify(query)});
+      const params = {query: JSON.stringify(query)};
+      if (explain.checked) params.explain = '1';
+      const r = await api('/api/mqlread', params);
       status.textContent = `${Math.round(performance.now() - started)} ms`;
-      out.replaceChildren(el('pre', {class: 'json'}, renderJson(r.result)));
+      out.replaceChildren(el('pre', {class: 'json'}, renderJson(r.result)),
+        r.explain ? renderExplain(r.explain) : null);
     } catch (e) {
       status.textContent = '';
-      out.replaceChildren(el('div', {class: 'error'}, e.message));
+      out.replaceChildren(el('div', {class: 'error'}, e.message),
+        e.body && e.body.explain ? renderExplain(e.body.explain) : null);
     }
   }
 
@@ -223,6 +350,7 @@ function showQuery() {
     text,
     el('div', {class: 'toolbar'},
       el('button', {onclick: run}, 'Run'),
+      el('label', {class: 'note', for: 'explain'}, explain, ' Explain'),
       el('span', {class: 'note'}, '⌘/Ctrl + Enter'),
       status),
     out);

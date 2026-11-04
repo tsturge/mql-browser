@@ -7,9 +7,13 @@ the objects that link to it.
 - `server.py` is the web service, a WSGI application run by gunicorn. It
   runs MQL reads through pymql against the graphd named by `GRAPHD_ADDR`
   and answers:
-  - `GET /api/mqlread?query=JSON[&cursor=C]`: an MQL read, with
-    Freebase's reply format (`{"code": "/api/status/ok", "result": ...}`).
-    An empty `cursor` starts paging.
+  - `GET /api/mqlread?query=JSON[&cursor=C][&explain=1]`: an MQL read,
+    with Freebase's reply format (`{"code": "/api/status/ok", "result":
+    ...}`). An empty `cursor` starts paging. With `explain=1` the reply,
+    an error's too, has an `explain` listing the graphd requests the read
+    made: each one's kind (`query`, the read itself; `schema`; or `id
+    lookup`), its graphd query text, its time and graphd's cost for it
+    (see "cost" in graphd's `doc/gr-protocol.txt`).
   - `GET /api/topic?id=ID`: everything the browser shows for an object
   - `GET /api/search?q=TEXT`: objects whose names match, the last word as
     a prefix
@@ -58,6 +62,9 @@ $ PYTHONPATH=.. ~/.local/pymql-py3/bin/python server_test.py
 - `#/search/TEXT`: name search. Entering an id (`/en/...` or a `#guid`)
   in the search box goes straight to the object.
 - `#/query`: an MQL query editor; ids in the results link to their pages.
+  With Explain checked, the results are followed by the graphd requests
+  behind them, one constraint per line, with their costs; guids in them
+  link to their objects.
 - `#/graph/ID`: a graph of objects and the links between them, drawn
   with [vis-network](https://visjs.github.io/vis-network/) (9.1.9, in
   `static/vendor/`). Double-click a node to expand it (or contract it

@@ -397,6 +397,50 @@ class ServerTest(GraphdTestCase):
     self.assertEqual(status, 400)
     self.assertIn('missing parameter: query', body['messages'][0]['message'])
 
+  def testMqlreadExplain(self):
+    query = [{'type': '/t/album', 'name': None, 'artist': {'id': BAND}}]
+    status, body = self.get_json(
+        '/api/mqlread', query=json.dumps(query), explain='1')
+    self.assertEqual(status, 200)
+    self.assertCountEqual([r['name'] for r in body['result']],
+                          ['First Light', 'Second Wind & Co'])
+    explain = body['explain']
+    requests = explain['requests']
+    # Exactly one request is the read itself; resolving /t/album and
+    # its properties takes others.
+    queries = [r for r in requests if r['kind'] == 'query']
+    self.assertLen(queries, 1)
+    self.assertTrue(queries[0]['query'].startswith('read '))
+    self.assertIn('schema', {r['kind'] for r in requests})
+    self.assertIn('id lookup', {r['kind'] for r in requests})
+    for r in requests:
+      self.assertGreaterEqual(r['ms'], 0)
+      self.assertIsNone(r['error'])
+      self.assertIn('dr', r['cost'])
+    self.assertAlmostEqual(explain['graphd_ms'],
+                           sum(r['ms'] for r in requests))
+    self.assertGreaterEqual(explain['ms'], explain['graphd_ms'])
+
+  def testMqlreadWithoutExplain(self):
+    for explain in ({}, {'explain': '0'}):
+      status, body = self.get_json(
+          '/api/mqlread', query=json.dumps({'id': BAND, 'name': None}),
+          **explain)
+      self.assertEqual(status, 200)
+      self.assertNotIn('explain', body)
+
+  def testMqlreadExplainsErrors(self):
+    status, body = self.get_json(
+        '/api/mqlread', explain='1',
+        query=json.dumps({'id': BAND, 'no_such_property': None}))
+    self.assertEqual(status, 400)
+    self.assertEqual(body['messages'][0]['code'], '/api/status/error/mql/type')
+    self.assertNotEqual(body['explain']['requests'], [])
+    # Without explain, no trace is left behind for the next read.
+    status, body = self.get_json(
+        '/api/mqlread', query=json.dumps({'id': BAND, 'name': None}))
+    self.assertNotIn('explain', body)
+
   def testTopicApi(self):
     status, body = self.get_json('/api/topic', id=BAND)
     self.assertEqual(status, 200)

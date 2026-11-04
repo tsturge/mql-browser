@@ -228,3 +228,33 @@ div.vis-tooltip {
   .graph-body { flex-direction: column; }
   .graph-panel { width: auto; }
 }
+
+/* explain */
+.toolbar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.explain p { margin: 0 0 8px; }
+.costs { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.cost {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--chip);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  cursor: help;
+}
+.gq-costs { margin: 8px 0 12px; }
+.gq, .gq-group { border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; }
+.gq-group > .gq { margin: 8px 12px; }
+.gq summary, .gq-group > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.gq-n { color: var(--muted); font-size: 13px; min-width: 2.5em; }
+.gq-kind { font-weight: 600; }
+.gq-error { color: var(--error); font-weight: 600; }
+.gq .gq-text { margin: 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gq .gq-costs, .gq .error { margin: 8px 12px 12px; }
+.gq-text a.guid { color: var(--accent); }
