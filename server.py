@@ -72,9 +72,12 @@ class ExplainedError(Exception):
 class Trace(object):
   """The graphd requests one MQL read makes, for explain=1.
 
+  cache says whether the read used the cached schema and ids ("kept"),
+  or started afresh ("new", or "flushed" because graphd had changed).
   Each request is {"kind", "query", "ms", "cost", "error"}: kind says
-  what pymql sent it for ("query" is the read itself; "schema" loads
-  types and properties; "id lookup" resolves ids and namespace keys);
+  what it was for ("query" is the read itself; "schema" loads types and
+  properties; "id lookup" resolves ids and namespace keys; "dateline"
+  checks whether graphd has changed);
   query is the graphd request; ms the time to its reply; cost graphd's
   account of the work (see the "cost" reply in graphd's
   doc/gr-protocol.txt).
@@ -82,6 +85,7 @@ class Trace(object):
 
   def __init__(self):
     self.requests = []
+    self.cache = None
     self.start = time.time()
     self.ms = None
 
@@ -93,12 +97,15 @@ class Trace(object):
     return {
         'ms': self.ms,
         'graphd_ms': graphd_ms,
+        'cache': self.cache,
         'requests': self.requests,
     }
 
 
-def request_kind(stack):
-  """What pymql sent a graphd request for, from the stack sending it."""
+def request_kind(msg, stack):
+  """What a graphd request was for, from it and the stack sending it."""
+  if msg.startswith('status '):
+    return 'dateline'
   modules = set()
   for frame in stack:
     path = frame.filename.replace(os.sep, '/')
@@ -125,7 +132,7 @@ class TracingConnector(graph.TcpGraphConnector):
     if trace is None:
       return super().transmit_query(msg, policy, deadline, **kwargs)
     entry = {
-        'kind': request_kind(traceback.extract_stack()),
+        'kind': request_kind(msg, traceback.extract_stack()),
         'query': msg,
         'cost': None,
         'error': None,
@@ -151,6 +158,31 @@ class Graph(object):
     host, port = addr.rsplit(':', 1)
     self.connector = TracingConnector(addrs=[(host, int(port))])
     self.lock = threading.Lock()
+    # One MQLService, kept while graphd is unchanged: it caches schema
+    # (types and properties) and namespaces (ids), which otherwise cost
+    # dozens of graphd requests a read. graphd's dateline changes with
+    # every write, so a new dateline means a new service and empty
+    # caches; reads never see stale ids or schema.
+    self.service = None
+    self.dateline = None
+
+  def current_dateline(self):
+    """graphd's dateline: an odometer that every write advances."""
+    r = self.connector.transmit_query(
+        'status cost="" dateline="" ()', self.connector._get_policy(), None)
+    return r.dateline
+
+  def mql_service(self, trace):
+    """The service for a read, new if graphd has changed since the last."""
+    dateline = self.current_dateline()
+    if self.service is None or dateline != self.dateline:
+      if trace:
+        trace.cache = 'new' if self.service is None else 'flushed'
+      self.service = MQLService(connector=self.connector)
+      self.dateline = dateline
+    elif trace:
+      trace.cache = 'kept'
+    return self.service
 
   def read(self, query, cursor=None, trace=None):
     """Runs an MQL read; with a Trace, records its graphd requests."""
@@ -162,9 +194,13 @@ class Graph(object):
     with self.lock:
       self.connector.trace = trace
       try:
-        # A new service per read: MQLService caches namespace contents
-        # and would not see changes made by other clients.
-        r = MQLService(connector=self.connector).read(query, **env)
+        r = self.mql_service(trace).read(query, **env)
+      except error.MQLError:
+        raise
+      except Exception:
+        # Something unexpected: don't trust the service's caches.
+        self.service = None
+        raise
       finally:
         self.connector.trace = None
         if trace:

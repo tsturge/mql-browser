@@ -88,6 +88,11 @@ def _get(port, path, **params):
     return e.code, e.read()
 
 
+def _addr(host_port):
+  host, port = host_port.rsplit(':', 1)
+  return host, int(port)
+
+
 def _text(value):
   return {'value': value, 'lang': '/lang/en'}
 
@@ -398,6 +403,7 @@ class ServerTest(GraphdTestCase):
     self.assertIn('missing parameter: query', body['messages'][0]['message'])
 
   def testMqlreadExplain(self):
+    self.graph.service = None  # Start with nothing cached.
     query = [{'type': '/t/album', 'name': None, 'artist': {'id': BAND}}]
     status, body = self.get_json(
         '/api/mqlread', query=json.dumps(query), explain='1')
@@ -408,6 +414,8 @@ class ServerTest(GraphdTestCase):
     requests = explain['requests']
     # Exactly one request is the read itself; resolving /t/album and
     # its properties takes others.
+    self.assertEqual(explain['cache'], 'new')
+    self.assertEqual(requests[0]['kind'], 'dateline')
     queries = [r for r in requests if r['kind'] == 'query']
     self.assertLen(queries, 1)
     self.assertTrue(queries[0]['query'].startswith('read '))
@@ -420,6 +428,35 @@ class ServerTest(GraphdTestCase):
     self.assertAlmostEqual(explain['graphd_ms'],
                            sum(r['ms'] for r in requests))
     self.assertGreaterEqual(explain['ms'], explain['graphd_ms'])
+
+  def testCacheIsKeptUntilGraphdChanges(self):
+    query = json.dumps({'id': BAND, 'name': None})
+
+    def read(q=query):
+      status, body = self.get_json('/api/mqlread', query=q, explain='1')
+      self.assertEqual(status, 200, body)
+      return body
+
+    read()
+    body = read()
+    self.assertEqual(body['explain']['cache'], 'kept')
+    # Only the dateline check and the query: schema and ids are cached.
+    self.assertEqual([r['kind'] for r in body['explain']['requests']],
+                     ['dateline', 'query'])
+
+    # Another client writes: a new object, under a new key in a
+    # namespace the server has cached.
+    pymql.MQLService(connector=graph.TcpGraphConnector(
+        addrs=[tuple(_addr(self.graphd_addr))])).write({
+            'create': 'unconditional', 'id': None,
+            'key': {'namespace': '/en', 'value': 'cache_probe'},
+            'name': _text('Cache probe'),
+        }, **ROOT)
+    body = read(json.dumps({'id': '/en/cache_probe', 'name': None}))
+    self.assertEqual(body['explain']['cache'], 'flushed')
+    self.assertEqual(body['result'], {'id': '/en/cache_probe',
+                                      'name': 'Cache probe'})
+    self.assertEqual(read()['explain']['cache'], 'kept')
 
   def testMqlreadWithoutExplain(self):
     for explain in ({}, {'explain': '0'}):

@@ -209,7 +209,14 @@ const KINDS = {
   'query': ['query', 'queries', 'the read itself, compiled to graphd'],
   'schema': ['schema load', 'schema loads', 'types and properties the query names'],
   'id lookup': ['id lookup', 'id lookups', 'ids and namespace keys resolved to guids'],
+  'dateline': ['dateline check', 'dateline checks', 'has graphd changed since the last read?'],
   'other': ['other request', 'other requests', ''],
+};
+
+const CACHE_NOTES = {
+  kept: 'Schema and ids came from the server\'s cache.',
+  new: 'The server\'s cache of schema and ids was empty.',
+  flushed: 'graphd had changed, so the server dropped its cache of schema and ids.',
 };
 
 function ms(n) { return n < 10 ? n.toFixed(1) + ' ms' : Math.round(n) + ' ms'; }
@@ -290,7 +297,7 @@ function renderExplain(x) {
     el('p', {},
       `${countOf(reqs.length, 'graphd request', 'graphd requests')}, `
       + `${ms(x.graphd_ms)} waiting on graphd of ${ms(x.ms)} in all: `
-      + kinds.map(count).join(', ') + '.'),
+      + kinds.map(count).join(', ') + '. ' + (CACHE_NOTES[x.cache] || '')),
     el('div', {class: 'gq-costs'}, costChips(totals, Object.keys(COSTS))),
     kinds.map(k => {
       // The query itself is shown open; the rest folded by kind.

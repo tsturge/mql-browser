@@ -11,14 +11,23 @@ the objects that link to it.
     with Freebase's reply format (`{"code": "/api/status/ok", "result":
     ...}`). An empty `cursor` starts paging. With `explain=1` the reply,
     an error's too, has an `explain` listing the graphd requests the read
-    made: each one's kind (`query`, the read itself; `schema`; or `id
-    lookup`), its graphd query text, its time and graphd's cost for it
-    (see "cost" in graphd's `doc/gr-protocol.txt`).
+    made: each one's kind (`query`, the read itself; `schema`; `id
+    lookup`; or `dateline`, the check described below), its graphd
+    query text, its time and graphd's cost for it
+    (see "cost" in graphd's `doc/gr-protocol.txt`), and whether the
+    server's cache was used.
   - `GET /api/topic?id=ID`: everything the browser shows for an object
   - `GET /api/search?q=TEXT`: objects whose names match, the last word as
     a prefix
   - `GET /api/relations?id=ID` and `GET /api/expand?id=ID[&via=P&to=Q]`:
     an object's neighbours, for the graph view
+
+  Each gunicorn worker keeps one pymql `MQLService`, whose caches of
+  schema (types and properties) and namespaces (ids) save dozens of
+  graphd requests a read: a dblp person's page takes 10 ms rather than
+  200. Before each read the server asks graphd for its dateline, which
+  every write advances; if it has moved, the server starts a new
+  service with empty caches, so reads never see stale schema or ids.
 - `static/` is the browser, a single page using those APIs.
 - nginx serves `static/` and passes `/api/` to gunicorn over a Unix
   socket (`nginx.conf.in`). It also serves the MQL manual, from the
